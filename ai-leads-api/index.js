@@ -16,7 +16,12 @@ const localProxy = new ProxyAgent('http://127.0.0.1:10809');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' })); // ДОБАВЛЕНО: без этого base64-фото из загрузки/вставки будут падать с 413 (лимит по умолчанию — 100kb)
+// Увеличиваем лимит, так как фото приходят в base64 (до 6 шт по ~4 МБ)[cite: 3, 5]
+app.use(express.json({ limit: '40mb' })); 
+app.use(cors());
 
+// Подключаем маршрут для Telegram-бота
+app.use(require('./telegram-lead-endpoint'));
 const PORT = 5000;
 
 const serviceAccount = require('./firebase-key.json');
@@ -26,12 +31,12 @@ initializeApp({
 const db = getFirestore();
 
 const openai = new OpenAI({
-    apiKey: "sk-GwcdGcx8T97LBHJ6NkGGyjaW6OhrckKS",
+    apiKey: process.env.OPENAI_API_KEY, 
     baseURL: "https://api.proxyapi.ru/openai/v1",
 });
 
 const apifyClient = new ApifyClient({
-    token: 'apify_api_etM4ygZqqIXXfzOYWaoNA5X0u6bsoz2wv4WM',
+    token: process.env.APIFY_TOKEN,     
 });
 
 function withTimeout(promise, ms, label) {

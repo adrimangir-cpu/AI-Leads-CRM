@@ -1,116 +1,581 @@
 "use client";
-import { useState, useEffect } from 'react';
-import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, setDoc } from 'firebase/firestore';
-import { db, auth, storage } from '../firebase'; 
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'; 
+
+/* ============================================================
+   ADRIANA RETOUCH — один файл на два состояния:
+   • не авторизован → публичное портфолио (обо мне, категории,
+     каталоги съёмок, до/после, контакты, форма → Telegram)
+   • авторизован    → закрытая CRM и панель управления сайтом
+
+   Firestore:
+     portfolio_shoots     { category, title, year, order, cover, photos:[{url,w,h,path}] }
+     before_after         { title, note, beforeUrl, afterUrl, order }
+     site_settings/public { tagline, aboutNote, about[], facts[], heroUrl, aboutUrl, contacts{} }
+     leads_portfolio      { name, contact, task, message, photosCount, status, createdAt }
+
+   Фото съёмок и до/после лежат в Firebase Storage, в Firestore — только ссылки.
+   ============================================================ */
+
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
+import { db, auth, storage } from '../firebase';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
   { id: 'base', num: '01', label: 'База клиентов' },
   { id: 'search', num: '02', label: 'Умный поиск' },
-  { id: 'portfolio', num: '03', label: 'Портфолио 🌟' },
+  { id: 'portfolio', num: '03', label: 'Сайт и портфолио' },
   { id: 'orders', num: '04', label: 'Учет заказов' },
   { id: 'mail', num: '05', label: 'Рассылка' },
 ];
 
-const API_BASE = 'http://localhost:5000';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:5000';
 
-// === УМНАЯ СЕТКА ФОТОГРАФИЙ (ЖУРНАЛЬНАЯ ВЕРСТКА) ===
-const ROWS: Record<number, number[]> = {1:[1],2:[2],3:[1,2],4:[2,2],5:[2,3],6:[3,3],7:[2,2,3],8:[3,2,3],9:[3,3,3]};
-function rowsFor(n: number) {
-  if (ROWS[n]) return ROWS[n];
+const CATEGORIES = [
+  { id: 'beauty', num: '01', label: 'Бьюти' },
+  { id: 'lookbook', num: '02', label: 'Лук бук' },
+  { id: 'fashion', num: '03', label: 'Фешн' },
+  { id: 'art', num: '04', label: 'Творчество' },
+  { id: 'still', num: '05', label: 'Предметка' },
+];
+
+/* контакты-заглушки: показываются, пока в дашборде не заполнены свои */
+const FALLBACK_CONTACTS = {
+  telegram: { handle: '@adriana_retouch', url: 'https://t.me/adriana_retouch', sub: 'отвечаю быстрее всего' },
+  whatsapp: { handle: '+48 000 000 000', url: 'https://wa.me/48000000000', sub: 'звонки и сообщения' },
+  instagram: { handle: '@adriana.retouch', url: 'https://instagram.com/adriana.retouch', sub: 'свежие работы' },
+  email: { handle: 'hello@adriana.studio', url: 'mailto:hello@adriana.studio', sub: 'для брифов и договоров' },
+};
+
+/* ───────── умная раскладка: съёмка любого объёма → ряды по 1–3 кадра ───────── */
+const ROW_MAP = { 1: [1], 2: [2], 3: [1, 2], 4: [2, 2], 5: [2, 3], 6: [3, 3], 7: [2, 2, 3], 8: [3, 2, 3], 9: [3, 3, 3] };
+function rowsFor(n) {
+  if (ROW_MAP[n]) return ROW_MAP[n];
   const r = []; let left = n;
-  while(left > 0) { 
-    if(left === 4) { r.push(2,2); left = 0; } 
-    else if(left === 1 && r.length) { r[r.length-1] += 1; left = 0; } 
-    else { const t = Math.min(3, left); r.push(t); left -= t; } 
+  while (left > 0) {
+    if (left === 4) { r.push(2, 2); left = 0; }
+    else if (left === 1 && r.length) { r[r.length - 1] += 1; left = 0; }
+    else { const t = Math.min(3, left); r.push(t); left -= t; }
   }
   return r;
 }
-const W: any = {1:[1], 2:[[1.32,1],[1,1.32]], 3:[[1,1.24,1],[1.24,1,1.1]]};
-const H: any = {1:['100%'], 2:[['100%','87%'],['88%','100%']], 3:[['93%','100%','85%'],['100%','86%','96%']]};
-const ROWH: any = {1:'clamp(400px,46vw,600px)', 2:'clamp(300px,32vw,500px)', 3:'clamp(230px,23vw,370px)'};
+const W = { 1: [1], 2: [[1.32, 1], [1, 1.32]], 3: [[1, 1.24, 1], [1.24, 1, 1.1]] };
+const H = { 1: ['100%'], 2: [['100%', '87%'], ['88%', '100%']], 3: [['93%', '100%', '85%'], ['100%', '86%', '96%']] };
+const ROWH = { 1: 'clamp(400px,46vw,600px)', 2: 'clamp(300px,32vw,500px)', 3: 'clamp(230px,23vw,370px)' };
 
-function buildRows(photos: any[]) {
+function buildRows(photos) {
   if (!photos || photos.length === 0) return [];
   const sizes = rowsFor(photos.length);
-  const out: any[] = []; 
-  let i = 0;
+  const out = []; let i = 0;
   sizes.forEach((size, ri) => {
-    const items = photos.slice(i, i+size).map((p, k) => ({
-      photo: p, idx: i+k,
-      flex: size === 1 ? 1 : W[size][ri%2][k],
-      h: size === 1 ? '100%' : H[size][ri%2][k],
+    const items = photos.slice(i, i + size).map((p, k) => ({
+      photo: p,
+      idx: i + k,
+      flex: size === 1 ? 1 : W[size][ri % 2][k],
+      h: size === 1 ? '100%' : H[size][ri % 2][k],
     }));
-    out.push({ size, h: ROWH[size], items, single: size===1 });
+    out.push({ size, h: ROWH[size], items, single: size === 1 });
     i += size;
   });
   return out;
 }
 
-// Функция сжатия картинки в легкую Base64 строку (формат JPEG, качество 70%)
-function compressImageToBase64(file: File, maxWidth = 800): Promise<string> {
+const plural = (n) => (n === 1 ? 'кадр' : n > 1 && n < 5 ? 'кадра' : 'кадров');
+
+/* сжатие в JPEG перед загрузкой в Storage */
+function compressImage(file, maxSide = 1600, quality = 0.82) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = (event) => {
-      const img = new Image();
-      img.src = event.target?.result as string;
+    reader.onerror = () => reject(new Error('не удалось прочитать файл'));
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onerror = () => reject(new Error('не удалось открыть изображение'));
       img.onload = () => {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
         const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-
-        if (width > maxWidth) {
-          height = Math.round((height * maxWidth) / width);
-          width = maxWidth;
-        }
-
-        canvas.width = width;
-        canvas.height = height;
-
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(img, 0, 0, width, height);
-
-        // Конвертируем в JPEG с качеством 70%
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-        resolve(dataUrl);
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => (blob ? resolve({ blob, w, h }) : reject(new Error('не удалось сжать кадр'))),
+          'image/jpeg',
+          quality
+        );
       };
-      img.onerror = (error) => reject(error);
+      img.src = reader.result;
     };
-    reader.onerror = (error) => reject(error);
+    reader.readAsDataURL(file);
   });
 }
 
-// === КОМПОНЕНТ ПОЛЗУНКА ДО/ПОСЛЕ ===
-function BeforeAfterSlider({ beforeUrl, afterUrl }: { beforeUrl: string, afterUrl: string }) {
-  const [sliderPos, setSliderPos] = useState(50);
+const fileToDataUri = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(reader.result);
+  reader.onerror = reject;
+  reader.readAsDataURL(file);
+});
+
+/* ───────── ползунок до/после ───────── */
+function BeforeAfter({ item }) {
+  const stage = useRef(null);
+  const [pos, setPos] = useState(50);
+  const drag = useRef(false);
+
+  const set = (clientX) => {
+    if (!stage.current) return;
+    const r = stage.current.getBoundingClientRect();
+    setPos(Math.max(2, Math.min(98, ((clientX - r.left) / r.width) * 100)));
+  };
+
+  useEffect(() => {
+    const up = () => { drag.current = false; };
+    window.addEventListener('pointerup', up);
+    return () => window.removeEventListener('pointerup', up);
+  }, []);
+
   return (
-    <div style={{ position: 'relative', width: '100%', aspectRatio: '4/5', background: '#e5e5e5', overflow: 'hidden' }}>
-      <img src={afterUrl} alt="After" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
-      <div style={{ position: 'absolute', inset: 0, clipPath: `inset(0 ${100 - sliderPos}% 0 0)` }}>
-        <img src={beforeUrl} alt="Before" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+    <div className="ba">
+      <div
+        className="ba-stage"
+        ref={stage}
+        onPointerDown={(e) => { drag.current = true; set(e.clientX); }}
+        onPointerMove={(e) => { if (drag.current) set(e.clientX); }}
+      >
+        <img src={item.beforeUrl} alt="До обработки" draggable={false} />
+        <img className="ba-after" src={item.afterUrl} alt="После обработки" draggable={false} style={{ clipPath: `inset(0 0 0 ${pos}%)` }} />
+        <span className="ba-tag l">До</span>
+        <span className="ba-tag r">После</span>
+        <div className="ba-line" style={{ left: `${pos}%` }} />
+        <div className="ba-knob" style={{ left: `${pos}%` }}>⇄</div>
       </div>
-      <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${sliderPos}%`, width: '2px', background: '#fff', transform: 'translateX(-50%)', pointerEvents: 'none' }} />
-      <input 
-        type="range" min="0" max="100" value={sliderPos} onChange={(e) => setSliderPos(Number(e.target.value))}
-        style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'ew-resize', width: '100%', height: '100%' }}
-      />
+      <div className="ba-cap">
+        <span className="label">{item.title}</span>
+        <span className="label">{item.note}</span>
+      </div>
     </div>
   );
 }
 
+/* ───────── лайтбокс ───────── */
+function Lightbox({ list, idx, onClose, onMove }) {
+  useEffect(() => {
+    const k = (e) => {
+      if (e.key === 'Escape') onClose();
+      if (e.key === 'ArrowLeft') onMove(-1);
+      if (e.key === 'ArrowRight') onMove(1);
+    };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [onClose, onMove]);
+
+  if (idx === null || idx === undefined || !list[idx]) return null;
+  return (
+    <div className="lb on" onClick={(e) => { if (e.target.classList.contains('lb')) onClose(); }}>
+      <button className="lb-x" onClick={onClose} aria-label="Закрыть">✕</button>
+      <button className="lb-p" onClick={() => onMove(-1)} aria-label="Предыдущий кадр">‹</button>
+      <img src={list[idx].url} alt={list[idx].cap} />
+      <button className="lb-n" onClick={() => onMove(1)} aria-label="Следующий кадр">›</button>
+      <div className="lb-cap">{list[idx].cap}</div>
+    </div>
+  );
+}
+
+/* ───────── форма: быстрое сообщение + фото → Telegram ───────── */
+function LeadForm() {
+  const [files, setFiles] = useState([]);
+  const [hot, setHot] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(null);
+  const [err, setErr] = useState('');
+
+  const add = async (list) => {
+    const imgs = [...list].filter((f) => f.type.startsWith('image/')).slice(0, 6);
+    const next = await Promise.all(imgs.map(async (f) => ({ name: f.name, dataUrl: await fileToDataUri(f) })));
+    setFiles((prev) => [...prev, ...next].slice(0, 6));
+  };
+
+  useEffect(() => {
+    const onPaste = (e) => { if (e.clipboardData && e.clipboardData.files.length) add(e.clipboardData.files); };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.currentTarget);
+    const payload = {
+      name: f.get('name'),
+      contact: f.get('contact'),
+      task: f.get('task'),
+      message: f.get('message'),
+      photos: files,
+      source: 'Сайт-портфолио',
+    };
+    setSending(true); setErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/lead-photo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || `статус ${res.status}`);
+
+      // дубль заявки в дашборд (без самих фото — они уже в Telegram)
+      try {
+        await addDoc(collection(db, 'leads_portfolio'), {
+          name: payload.name, contact: payload.contact, task: payload.task, message: payload.message,
+          photosCount: files.length, status: 'New', createdAt: new Date().toISOString(),
+        });
+      } catch (e2) { console.error('лог заявки не записался', e2); }
+
+      setDone({ name: payload.name, contact: payload.contact, count: files.length });
+    } catch (e3) {
+      setErr('Не получилось отправить: ' + e3.message + '. Напиши мне напрямую в Telegram — так точно дойдёт.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <div className="ok">
+        <strong>Заявка отправлена.</strong>
+        <br />
+        {done.name}, я получила {done.count > 0 ? `${done.count} ${done.count === 1 ? 'фото' : 'фото'}` : 'твоё сообщение'} и отвечу на {done.contact} в течение дня.
+        <br />
+        <button type="button" className="btn ghost" style={{ marginTop: 18 }} onClick={() => { setDone(null); setFiles([]); }}>
+          Отправить ещё
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <form className="form" onSubmit={submit}>
+      <div className="form-row">
+        <label className="field"><span>Имя</span><input name="name" required placeholder="Как к тебе обращаться" /></label>
+        <label className="field"><span>Телефон или telegram</span><input name="contact" required placeholder="+48… или @username" /></label>
+      </div>
+      <label className="field">
+        <span>Что нужно обработать</span>
+        <select name="task" defaultValue="Бьюти — портрет / макро">
+          <option>Бьюти — портрет / макро</option>
+          <option>Лук бук</option>
+          <option>Фешн-съёмка</option>
+          <option>Творческий проект</option>
+          <option>Предметка</option>
+        </select>
+      </label>
+      <label className="field"><span>Сообщение</span><textarea name="message" placeholder="Пара слов о задаче и сроках" /></label>
+
+      <div
+        className={`drop ${hot ? 'hot' : ''}`}
+        onDragOver={(e) => { e.preventDefault(); setHot(true); }}
+        onDragLeave={() => setHot(false)}
+        onDrop={(e) => { e.preventDefault(); setHot(false); add(e.dataTransfer.files); }}
+      >
+        <span>Приложи фото на тест — перетащи сюда, вставь из буфера или</span>
+        <label className="pick">
+          Выбрать файлы
+          <input type="file" accept="image/*" multiple hidden onChange={(e) => { add(e.target.files); e.target.value = ''; }} />
+        </label>
+        {files.length > 0 && (
+          <div className="thumbs">
+            {files.map((f, i) => (
+              <div className="thumb" key={i}>
+                <img src={f.dataUrl} alt={`Вложение ${i + 1}`} />
+                <button type="button" onClick={() => setFiles(files.filter((_, k) => k !== i))} aria-label="Убрать фото">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <button type="submit" className="btn" style={{ width: 'fit-content' }} disabled={sending}>
+        {sending ? 'Отправляю…' : 'Отправить'} <span>→</span>
+      </button>
+      {err && <p className="note" style={{ color: '#8A3B33' }}>{err}</p>}
+      <p className="note">Заявка приходит мне в Telegram вместе с фото — обычно отвечаю в тот же день.</p>
+    </form>
+  );
+}
+
+/* ═════════════════ ПУБЛИЧНОЕ ПОРТФОЛИО ═════════════════ */
+function PublicSite({ onAdminClick }) {
+  const [shoots, setShoots] = useState([]);
+  const [ba, setBa] = useState([]);
+  const [settings, setSettings] = useState(null);
+  const [cat, setCat] = useState(CATEGORIES[0].id);
+  const [lb, setLb] = useState({ list: [], idx: null });
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [sSnap, bSnap, cfg] = await Promise.all([
+          getDocs(query(collection(db, 'portfolio_shoots'), orderBy('order', 'asc'))),
+          getDocs(query(collection(db, 'before_after'), orderBy('order', 'asc'))),
+          getDoc(doc(db, 'site_settings', 'public')),
+        ]);
+        setShoots(sSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((s) => (s.photos || []).length));
+        setBa(bSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        if (cfg.exists()) setSettings(cfg.data());
+      } catch (e) {
+        console.error('не загрузился контент сайта', e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const counts = useMemo(() => {
+    const m = {};
+    CATEGORIES.forEach((c) => {
+      m[c.id] = shoots.filter((s) => s.category === c.id).reduce((a, s) => a + (s.photos?.length || 0), 0);
+    });
+    return m;
+  }, [shoots]);
+
+  /* если в выбранной категории пусто — показываем первую непустую */
+  useEffect(() => {
+    if (!loading && !shoots.some((s) => s.category === cat)) {
+      const first = CATEGORIES.find((c) => shoots.some((s) => s.category === c.id));
+      if (first) setCat(first.id);
+    }
+  }, [loading, shoots]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const visible = shoots.filter((s) => s.category === cat);
+  const contacts = { ...FALLBACK_CONTACTS, ...(settings?.contacts || {}) };
+  const facts = settings?.facts || [
+    { label: 'Опыт', value: '06', note: 'лет в постобработке' },
+    { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
+    { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
+  ];
+  const heroPhoto = settings?.heroUrl || shoots[0]?.photos?.[0]?.url || '';
+  const aboutPhoto = settings?.aboutUrl || '';
+  const year = new Date().getFullYear();
+
+  const openLb = (shoot, idx) => setLb({
+    list: shoot.photos.map((p, i) => ({ url: p.url, cap: `${shoot.title} — ${i + 1} / ${shoot.photos.length}` })),
+    idx,
+  });
+
+  return (
+    <>
+      <style dangerouslySetInnerHTML={{ __html: SITE_CSS }} />
+
+      <div className="strip">
+        <span>Приём фото на тест-ретушь открыт</span>
+        <span>Beauty · Fashion · Still life</span>
+        <span>Warsaw · Online</span>
+      </div>
+
+      <nav className="topnav">
+        <div className="brand">
+          <svg width="24" height="24" viewBox="0 0 26 26" fill="none" aria-label="Adriana Retouch">
+            <rect x=".5" y=".5" width="25" height="25" stroke="currentColor" />
+            <path d="M6 20 13 6l7 14" stroke="currentColor" strokeWidth="1.4" />
+            <path d="M9 15h8" stroke="currentColor" strokeWidth="1.4" />
+          </svg>
+          <div><span className="brand-word">Adriana</span> <span className="brand-sub">Retouch</span></div>
+        </div>
+        <div className="navlinks">
+          <a href="#about">Обо мне</a>
+          <a href="#work">Портфолио</a>
+          {ba.length > 0 && <a href="#ba">До / после</a>}
+          <a href="#contact">Контакты</a>
+          <button className="admin" onClick={onAdminClick}>Admin</button>
+        </div>
+      </nav>
+
+      <section className="hero">
+        <div className="hero-l">
+          <div className="hero-svc">
+            <div><span className="label">01 — Beauty</span><span className="label">портрет, макро, косметика</span></div>
+            <div><span className="label">02 — Fashion</span><span className="label">лукбуки, кампании, редакции</span></div>
+            <div><span className="label">03 — Still life</span><span className="label">украшения, парфюм, предметка</span></div>
+          </div>
+          <div>
+            <div className="hero-over">post-production</div>
+            <h1 className="display hero-main">adriana</h1>
+            <div className="hero-meta">
+              <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
+              <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
+            </div>
+            <div className="hero-cta">
+              <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
+              <a href="#work" className="btn ghost">Смотреть работы</a>
+            </div>
+          </div>
+        </div>
+        <figure className="hero-img">
+          {heroPhoto ? <img src={heroPhoto} alt="Бьюти-портрет после ретуши" /> : <div className="hero-empty"><span className="label">Загрузи первую съёмку в дашборде</span></div>}
+          <figcaption><span className="label">Beauty · {year}</span><span className="label">— 001</span></figcaption>
+        </figure>
+      </section>
+
+      <div className="rule" />
+      <section className="sec" id="about">
+        <div className="sec-head">
+          <div>
+            <div className="sec-num">01 — about</div>
+            <h2 className="display sec-title">обо мне</h2>
+          </div>
+          <p className="sec-note">{settings?.aboutNote || 'Шесть лет в цвете и ретуши. Половина работ — коммерческие съёмки, половина — авторские проекты фотографов.'}</p>
+        </div>
+        <div className="about">
+          {aboutPhoto ? <img src={aboutPhoto} alt="Адриана, ретушёр" /> : <div className="about-empty" />}
+          <div className="about-body">
+            {(settings?.about?.length ? settings.about : [
+              'Привет. Меня зовут Адриана, я ретушёр. Начинала с бьюти-макро, сейчас закрываю полный цикл постобработки: отбор, цвет, чистка, dodge & burn, финальная подготовка под печать и веб.',
+              'Главный принцип — кожа должна остаться кожей. Никакого пластика и «замыленных» лиц: я убираю лишнее, но оставляю поры, родинки и характер.',
+              'Работаю в Photoshop и Capture One, отдаю PSD со слоями по запросу. Средний срок — 1–2 дня на портрет, 5–7 дней на съёмку.',
+            ]).map((p, i) => <p key={i}>{p}</p>)}
+            <div className="facts">
+              {facts.map((f, i) => (
+                <div className="fact" key={i}>
+                  <div className="label">{f.label}</div>
+                  <div className="fact-v">{f.value}</div>
+                  <div className="fact-d">{f.note}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div className="rule" />
+      <section className="sec" id="work">
+        <div className="sec-head">
+          <div>
+            <div className="sec-num">02 — portfolio</div>
+            <h2 className="display sec-title">портфолио</h2>
+          </div>
+          <p className="sec-note">Выбери категорию — внутри работы собраны по съёмкам, так же как они приходят из студии.</p>
+        </div>
+
+        <div className="cats" role="tablist">
+          {CATEGORIES.map((c) => (
+            <button key={c.id} className="cat" role="tab" aria-selected={c.id === cat} onClick={(e) => { setCat(c.id); e.currentTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' }); }}>
+              <span className="c-num">{c.num}</span>{c.label}<span className="c-count">{counts[c.id] || 0}</span>
+            </button>
+          ))}
+        </div>
+
+        {loading && <p className="note" style={{ padding: '40px 0' }}>Загружаю съёмки…</p>}
+        {!loading && visible.length === 0 && <p className="note" style={{ padding: '40px 0' }}>В этой категории пока нет съёмок.</p>}
+
+        {visible.map((s) => (
+          <article className="shoot" key={s.id}>
+            <header className="shoot-head">
+              <h3 className="shoot-name">{s.title}</h3>
+              <div className="shoot-meta">
+                <span className="label">{s.photos.length} {plural(s.photos.length)}</span>
+                {s.year && <span className="label">{s.year}</span>}
+              </div>
+            </header>
+            <div className="mosaic">
+              {buildRows(s.photos).map((row, ri) => (
+                <div className={`mrow ${row.single ? 'single' : ''}`} style={{ height: row.h }} key={ri}>
+                  {row.items.map((it) => (
+                    <figure
+                      key={it.idx}
+                      className="cell"
+                      data-n={String(it.idx + 1).padStart(2, '0')}
+                      style={{
+                        flex: `${it.flex} 1 0`,
+                        height: it.h,
+                        ...(row.single ? { maxWidth: '66%', marginLeft: 'auto', marginRight: 'auto' } : {}),
+                      }}
+                      onClick={() => openLb(s, it.idx)}
+                    >
+                      <img src={it.photo.url} alt={`${s.title} — кадр ${it.idx + 1}`} loading="lazy" />
+                    </figure>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </article>
+        ))}
+      </section>
+
+      {ba.length > 0 && (
+        <>
+          <div className="rule" />
+          <section className="sec" id="ba">
+            <div className="sec-head">
+              <div>
+                <div className="sec-num">03 — before / after</div>
+                <h2 className="display sec-title">до / после</h2>
+              </div>
+              <p className="sec-note">Потяни ползунок. Слева — кадр из камеры, справа — после моей обработки.</p>
+            </div>
+            <div className="ba-grid">
+              {ba.map((item) => <BeforeAfter key={item.id} item={item} />)}
+            </div>
+          </section>
+        </>
+      )}
+
+      <div className="rule" />
+      <section className="sec" id="contact">
+        <div className="sec-head">
+          <div>
+            <div className="sec-num">04 — contact</div>
+            <h2 className="display sec-title">связаться</h2>
+          </div>
+          <p className="sec-note">Выбери удобный мессенджер — откроется сразу диалог. Или заполни форму: сообщение и фото придут мне в Telegram.</p>
+        </div>
+        <div className="contacts">
+          <div className="ch">
+            {[
+              ['Telegram', contacts.telegram],
+              ['WhatsApp', contacts.whatsapp],
+              ['Instagram', contacts.instagram],
+              ['Почта', contacts.email],
+            ].filter(([, v]) => v && v.url).map(([name, v]) => (
+              <a key={name} href={v.url} target={v.url.startsWith('mailto') ? undefined : '_blank'} rel="noopener noreferrer">
+                <span>
+                  <span className="ch-name">{name}</span>
+                  <span className="ch-sub">{v.handle}{v.sub ? ` · ${v.sub}` : ''}</span>
+                </span>
+                <span className="ch-arrow">↗</span>
+              </a>
+            ))}
+          </div>
+          <div id="form"><LeadForm /></div>
+        </div>
+      </section>
+
+      <footer className="site-footer">
+        <span className="label">© {year} Adriana Retouch</span>
+        <span className="label">Beauty · Fashion · Still life</span>
+      </footer>
+
+      <Lightbox
+        list={lb.list}
+        idx={lb.idx}
+        onClose={() => setLb({ list: [], idx: null })}
+        onMove={(d) => setLb((p) => ({ ...p, idx: (p.idx + d + p.list.length) % p.list.length }))}
+      />
+    </>
+  );
+}
+
+/* ═════════════════ СТРАНИЦА ═════════════════ */
 export default function Home() {
   const [activeTab, setActiveTab] = useState('search');
-  
+
   // --- БАЗА КЛИЕНТОВ ---
-  const [leads, setLeads] = useState<any[]>([]);
+  const [leads, setLeads] = useState([]);
   const [newName, setNewName] = useState('');
   const [newNiche, setNewNiche] = useState('');
   const [newEmail, setNewEmail] = useState('');
-  const [selectedLeadIds, setSelectedLeadIds] = useState<string[]>([]);
+  const [selectedLeadIds, setSelectedLeadIds] = useState([]);
   const [isDeletingLeads, setIsDeletingLeads] = useState(false);
-  const [editingLeadId, setEditingLeadId] = useState<string | null>(null);
+  const [editingLeadId, setEditingLeadId] = useState(null);
   const [editEmailValue, setEditEmailValue] = useState('');
 
   // --- УМНЫЙ ПОИСК ---
@@ -118,131 +583,95 @@ export default function Home() {
   const [isSearching, setIsSearching] = useState(false);
   const [isTransferring, setIsTransferring] = useState(false);
   const [isRejecting, setIsRejecting] = useState(false);
-  const [searchResults, setSearchResults] = useState<any[]>([]);
-  const [selectedForBase, setSelectedForBase] = useState<number[]>([]);
+  const [searchResults, setSearchResults] = useState([]);
+  const [selectedForBase, setSelectedForBase] = useState([]);
   const [referenceProfile, setReferenceProfile] = useState('');
-  const [referencePhotoDataUris, setReferencePhotoDataUris] = useState<string[]>([]);
+  const [referencePhotoDataUris, setReferencePhotoDataUris] = useState([]);
   const [referencePhotoUrlInput, setReferencePhotoUrlInput] = useState('');
   const [selectedStyle, setSelectedStyle] = useState('Beauty');
-  const [activePreviewData, setActivePreviewData] = useState<any>(null);
+  const [activePreviewData, setActivePreviewData] = useState(null);
   const [imgFailed, setImgFailed] = useState(false);
 
   // --- АВТОРИЗАЦИЯ И РАЗДЕЛЕНИЕ САЙТА ---
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
   const [showAdminLogin, setShowAdminLogin] = useState(false);
 
-  // --- СОСТОЯНИЯ ЛАЙТБОКСА (УВЕЛИЧЕНИЕ ФОТО) ---
-  const [lbOpen, setLbOpen] = useState(false);
-  const [lbList, setLbList] = useState<any[]>([]);
-  const [lbIdx, setLbIdx] = useState(0);
+  // --- КОНТЕНТ САЙТА (для панели управления) ---
+  const [publicSettings, setPublicSettings] = useState(null);
+  const [publicShoots, setPublicShoots] = useState([]);
+  const [publicBeforeAfter, setPublicBeforeAfter] = useState([]);
 
-  // Управление лайтбоксом с клавиатуры (стрелки и Esc)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!lbOpen) return;
-      if (e.key === 'Escape') setLbOpen(false);
-      if (e.key === 'ArrowLeft') setLbIdx((prev) => (prev - 1 + lbList.length) % lbList.length);
-      if (e.key === 'ArrowRight') setLbIdx((prev) => (prev + 1) % lbList.length);
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [lbOpen, lbList.length]);
+  // --- ПАНЕЛЬ УПРАВЛЕНИЯ САЙТОМ ---
+  const [cmsTab, setCmsTab] = useState('requests');
+  const [siteRequests, setSiteRequests] = useState([]);
 
-  const openLightbox = (shoot: any, photoIndex: number) => {
-    setLbList(shoot.photos.map((p: any, i: number) => ({
-      url: p.url, 
-      cap: `${shoot.title} — ${i + 1} /${shoot.photos.length}`
-    })));
-    setLbIdx(photoIndex);
-    setLbOpen(true);
-  };
-
-  // --- ДАННЫЕ ПУБЛИЧНОГО САЙТА ---
-  const [publicSettings, setPublicSettings] = useState<any>(null);
-  const [publicShoots, setPublicShoots] = useState<any[]>([]);
-  const [publicBeforeAfter, setPublicBeforeAfter] = useState<any[]>([]);
-
-  // --- СОСТОЯНИЯ CMS (АДМИНКА) ---
-  const [cmsTab, setCmsTab] = useState('requests'); 
-  const [siteRequests, setSiteRequests] = useState<any[]>([]);
-
-  // --- НАСТРОЙКИ (ТЕКСТЫ И КОНТАКТЫ) ---
+  // --- ТЕКСТЫ И КОНТАКТЫ ---
   const [editTagline, setEditTagline] = useState('');
+  const [editAboutNote, setEditAboutNote] = useState('');
   const [editAbout, setEditAbout] = useState('');
   const [editTg, setEditTg] = useState('');
+  const [editWa, setEditWa] = useState('');
   const [editIg, setEditIg] = useState('');
   const [editEmail, setEditEmail] = useState('');
 
-  // --- СОСТОЯНИЯ ЗАГРУЗОК (СЪЕМКИ И ДО/ПОСЛЕ) ---
+  // --- ЗАГРУЗКИ (СЪЁМКИ И ДО/ПОСЛЕ) ---
   const [showAddShoot, setShowAddShoot] = useState(false);
   const [shootTitle, setShootTitle] = useState('');
   const [shootCategory, setShootCategory] = useState('beauty');
   const [shootYear, setShootYear] = useState('');
-  const [shootFiles, setShootFiles] = useState<File[]>([]);
+  const [shootFiles, setShootFiles] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadStep, setUploadStep] = useState('');
 
   const [showAddBA, setShowAddBA] = useState(false);
   const [baTitle, setBaTitle] = useState('');
   const [baNote, setBaNote] = useState('');
-  const [baBefore, setBaBefore] = useState<File | null>(null);
-  const [baAfter, setBaAfter] = useState<File | null>(null);
+  const [baBefore, setBaBefore] = useState(null);
+  const [baAfter, setBaAfter] = useState(null);
   const [isUploadingBA, setIsUploadingBA] = useState(false);
-
-  // --- ФОРМА ЗАЯВКИ (ПУБЛИЧНЫЙ САЙТ) ---
-  const [reqName, setReqName] = useState('');
-  const [reqContact, setReqContact] = useState('');
-  const [reqTask, setReqTask] = useState('');
-  const [reqFiles, setReqFiles] = useState<File[]>([]);
-  const [isSendingReq, setIsSendingReq] = useState(false);
-  const [reqSent, setReqSent] = useState(false);
-
-  const fileToDataUri = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  };
 
   // Эффект: загрузка входящих заявок
   useEffect(() => {
     if (user) {
       getDocs(collection(db, 'leads_portfolio')).then(snap => {
         setSiteRequests(snap.docs.map(d => ({ id: d.id, ...d.data() }))
-          .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
       });
     }
   }, [user, cmsTab]);
 
-  // Эффект: загрузка публичного контента
+  // Эффект: контент сайта для панели управления (только для авторизованной)
   useEffect(() => {
+    if (!user) return;
     async function fetchPublic() {
       try {
-        const snapSettings = await getDocs(collection(db, 'site_settings'));
-        snapSettings.forEach(d => { if (d.id === 'public') setPublicSettings(d.data()); });
+        const cfg = await getDoc(doc(db, 'site_settings', 'public'));
+        if (cfg.exists()) setPublicSettings(cfg.data());
 
         const snapShoots = await getDocs(collection(db, 'portfolio_shoots'));
-        setPublicShoots(snapShoots.docs.map(d => ({ id: d.id, ...d.data() })).sort((a: any, b: any) => (a.order || 0) - (b.order || 0)));
+        setPublicShoots(snapShoots.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0)));
 
         const snapBA = await getDocs(collection(db, 'before_after'));
-        setPublicBeforeAfter(snapBA.docs.map(d => ({ id: d.id, ...d.data() })).sort((a: any, b: any) => (a.order || 0) - (b.order || 0)));
+        setPublicBeforeAfter(snapBA.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order || 0) - (b.order || 0)));
       } catch (e) {
-        console.error("Ошибка загрузки публичных данных:", e);
+        console.error('не загрузился контент сайта:', e);
       }
     }
     fetchPublic();
-  }, []);
+  }, [user]);
 
   // Эффект: подтягивание настроек в поля админки
   useEffect(() => {
     if (publicSettings) {
       setEditTagline(publicSettings.tagline || '');
-      setEditAbout((publicSettings.about || []).join('\n\n'));
+      setEditAboutNote(publicSettings.aboutNote || '');
+      setEditAbout((publicSettings.about || []).join('\n'));
       setEditTg(publicSettings.contacts?.telegram?.url || '');
+      setEditWa(publicSettings.contacts?.whatsapp?.url || '');
       setEditIg(publicSettings.contacts?.instagram?.url || '');
       setEditEmail(publicSettings.contacts?.email?.url?.replace('mailto:', '') || '');
     }
@@ -258,12 +687,12 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    fetchLeads();
-  }, []);
+    if (user) fetchLeads();
+  }, [user]);
 
   async function fetchLeads() {
     const querySnapshot = await getDocs(collection(db, 'leads'));
-    const leadsArray: any[] = [];
+    const leadsArray = [];
     querySnapshot.forEach((docSnap) => {
       leadsArray.push({ id: docSnap.id, ...docSnap.data() });
     });
@@ -271,12 +700,13 @@ export default function Home() {
   }
 
   // --- ХЭНДЛЕРЫ АВТОРИЗАЦИИ ---
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
+    setLoginError('');
     try {
       await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
-    } catch (error: any) {
-      alert("Ошибка входа: неверный email или пароль.");
+    } catch (error) {
+      setLoginError('Неверный email или пароль');
     }
   };
 
@@ -284,86 +714,90 @@ export default function Home() {
 
   // --- ХЭНДЛЕРЫ CMS И ПОРТФОЛИО ---
   const handleSaveSettings = async () => {
+    const handleFromUrl = (u) => {
+      if (!u) return '';
+      const clean = u.replace(/\/$/, '');
+      if (clean.startsWith('mailto:')) return clean.replace('mailto:', '');
+      if (clean.includes('wa.me/')) return '+' + clean.split('wa.me/')[1];
+      return '@' + clean.split('/').filter(Boolean).pop();
+    };
+    const contacts = { ...(publicSettings?.contacts || {}) };
+    if (editTg) contacts.telegram = { handle: handleFromUrl(editTg), url: editTg, sub: 'отвечаю быстрее всего' };
+    else delete contacts.telegram;
+    if (editWa) contacts.whatsapp = { handle: handleFromUrl(editWa), url: editWa, sub: 'звонки и сообщения' };
+    else delete contacts.whatsapp;
+    if (editIg) contacts.instagram = { handle: handleFromUrl(editIg), url: editIg, sub: 'свежие работы' };
+    else delete contacts.instagram;
+    if (editEmail) contacts.email = { handle: editEmail, url: `mailto:${editEmail}`, sub: 'для брифов и договоров' };
+    else delete contacts.email;
+
     const newSettings = {
       ...publicSettings,
       tagline: editTagline,
-      about: editAbout.split('\n\n').filter(Boolean),
-      contacts: {
-        ...publicSettings?.contacts,
-        telegram: { handle: "@telegram", url: editTg, sub: "отвечаю быстрее всего" },
-        instagram: { handle: "@instagram", url: editIg, sub: "свежие работы" },
-        email: { handle: "email", url: `mailto:${editEmail}`, sub: "для брифов" }
-      },
+      aboutNote: editAboutNote,
+      about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
+      contacts,
       facts: publicSettings?.facts || [
-        { label: "Опыт", value: "06", note: "лет в постобработке" },
-        { label: "Съёмок", value: "240+", note: "обработано с 2020" },
-        { label: "Тест-ретушь", value: "Free", note: "одно фото бесплатно" }
-      ]
+        { label: 'Опыт', value: '06', note: 'лет в постобработке' },
+        { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
+        { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
+      ],
     };
     await setDoc(doc(db, 'site_settings', 'public'), newSettings, { merge: true });
     setPublicSettings(newSettings);
-    alert('Настройки сайта обновлены!');
+    alert('Тексты и контакты обновлены');
   };
 
-const handleCreateShoot = async () => {
-    if (!shootTitle || shootFiles.length === 0) return alert('Укажи название и выбери фото!');
+  // Съёмка: сжимаем кадры и кладём в Firebase Storage, в Firestore — только ссылки.
+  // (Base64 в документ не влезает: лимит документа 1 МБ, 5 фото его пробивают.)
+  const handleCreateShoot = async () => {
+    if (!shootTitle.trim() || shootFiles.length === 0) return alert('Укажи название и выбери фото');
     setIsUploading(true);
-
     try {
-      const uploadedPhotos = [];
-      
+      const stamp = Date.now();
+      const photos = [];
       for (let i = 0; i < shootFiles.length; i++) {
-        const file = shootFiles[i];
-        
-        // 1. Сжимаем картинку в легкую Base64 строку прямо в браузере
-        const base64Url = await compressImageToBase64(file, 900);
-        
-        // 2. Узнаем реальные пропорции для журнальной сетки
-        const img = new window.Image();
-        img.src = base64Url;
-        await new Promise((resolve) => { img.onload = resolve; });
-
-        uploadedPhotos.push({ 
-          url: base64Url, 
-          w: img.width, 
-          h: img.height 
-        });
+        setUploadStep(`${i + 1} / ${shootFiles.length}`);
+        const { blob, w, h: hh } = await compressImage(shootFiles[i], 1600, 0.82);
+        const path = `portfolio/${stamp}_${String(i + 1).padStart(2, '0')}.jpg`;
+        const fileRef = ref(storage, path);
+        await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+        photos.push({ url: await getDownloadURL(fileRef), w, h: hh, path });
       }
-
-      // 3. Сохраняем съёмку в Firestore через привычный addDoc
       const newShoot = {
-        title: shootTitle,
+        title: shootTitle.trim(),
         category: shootCategory,
-        year: shootYear,
-        order: Date.now(),
-        photos: uploadedPhotos,
-        cover: uploadedPhotos[0]?.url || ''
+        year: shootYear.trim(),
+        order: stamp,
+        photos,
+        cover: photos[0]?.url || '',
       };
-      
       const docRef = await addDoc(collection(db, 'portfolio_shoots'), newShoot);
-
       setPublicShoots(prev => [...prev, { id: docRef.id, ...newShoot }]);
-      alert('Съёмка успешно сохранена в базу!');
       setShowAddShoot(false);
       setShootTitle(''); setShootFiles([]); setShootYear('');
-
-    } catch (error: any) {
-      alert('Ошибка: ' + error.message);
+      alert('Съёмка опубликована на сайте');
+    } catch (error) {
+      alert('Ошибка загрузки: ' + error.message);
     } finally {
       setIsUploading(false);
+      setUploadStep('');
     }
   };
 
   const handleCreateBA = async () => {
-    if (!baTitle || !baBefore || !baAfter) return alert('Заполните название и прикрепите оба фото!');
+    if (!baTitle || !baBefore || !baAfter) return alert('Заполни название и прикрепи оба кадра');
     setIsUploadingBA(true);
     try {
-      const refB = ref(storage, `before_after/${Date.now()}_before_${baBefore.name}`);
-      await uploadBytes(refB, baBefore);
+      const stamp = Date.now();
+      const before = await compressImage(baBefore, 1600, 0.82);
+      const refB = ref(storage, `before_after/${stamp}_before.jpg`);
+      await uploadBytes(refB, before.blob, { contentType: 'image/jpeg' });
       const beforeUrl = await getDownloadURL(refB);
 
-      const refA = ref(storage, `before_after/${Date.now()}_after_${baAfter.name}`);
-      await uploadBytes(refA, baAfter);
+      const after = await compressImage(baAfter, 1600, 0.82);
+      const refA = ref(storage, `before_after/${stamp}_after.jpg`);
+      await uploadBytes(refA, after.blob, { contentType: 'image/jpeg' });
       const afterUrl = await getDownloadURL(refA);
 
       const newBA = { title: baTitle, note: baNote, beforeUrl, afterUrl, order: Date.now() };
@@ -372,42 +806,14 @@ const handleCreateShoot = async () => {
       setPublicBeforeAfter(prev => [...prev, { id: docRef.id, ...newBA }]);
       setShowAddBA(false);
       setBaTitle(''); setBaNote(''); setBaBefore(null); setBaAfter(null);
-      alert('Интерактивный ползунок успешно создан!');
-    } catch (e: any) {
+      alert('Ползунок до/после добавлен на сайт');
+    } catch (e) {
       alert('Ошибка: ' + e.message);
     } finally {
       setIsUploadingBA(false);
     }
   };
 
-  const handleSendRequest = async () => {
-    if (!reqName || !reqContact) return alert('Пожалуйста, укажите имя и контакт для связи!');
-    setIsSendingReq(true);
-    try {
-      const photosBase64 = await Promise.all(reqFiles.map(async f => ({
-        name: f.name, dataUrl: await fileToDataUri(f)
-      })));
-
-      const res = await fetch(`${API_BASE}/api/lead-photo`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: reqName, contact: reqContact, task: reqTask, photos: photosBase64, source: 'Сайт-портфолио' })
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error);
-
-      await addDoc(collection(db, 'leads_portfolio'), {
-        name: reqName, contact: reqContact, task: reqTask,
-        photosCount: reqFiles.length, status: 'New', createdAt: new Date().toISOString()
-      });
-
-      setReqSent(true);
-      setReqName(''); setReqContact(''); setReqTask(''); setReqFiles([]);
-    } catch (e: any) {
-      alert('Ошибка при отправке: ' + e.message);
-    } finally {
-      setIsSendingReq(false);
-    }
-  };
 
   // --- ХЭНДЛЕРЫ РАБОТЫ С БАЗОЙ ---
   const handleAddLead = async () => {
@@ -423,18 +829,18 @@ const handleCreateShoot = async () => {
     setNewName(''); setNewNiche(''); setNewEmail('');
   };
 
-  const handleStatusChange = async (leadId: string, newStatus: string) => {
+  const handleStatusChange = async (leadId, newStatus) => {
     await updateDoc(doc(db, 'leads', leadId), { status: newStatus });
     setLeads(leads.map(lead => lead.id === leadId ? { ...lead, status: newStatus } : lead));
   };
 
-  const handleSaveLeadEmail = async (leadId: string) => {
+  const handleSaveLeadEmail = async (leadId) => {
     await updateDoc(doc(db, 'leads', leadId), { email: editEmailValue });
     setLeads(leads.map(lead => lead.id === leadId ? { ...lead, email: editEmailValue } : lead));
     setEditingLeadId(null);
   };
 
-  const toggleLeadSelection = (id: string) => {
+  const toggleLeadSelection = (id) => {
     setSelectedLeadIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
@@ -463,22 +869,22 @@ const handleCreateShoot = async () => {
   };
 
   // --- ХЭНДЛЕРЫ УМНОГО ПОИСКА ---
-  const addReferencePhotoFiles = async (files: FileList | File[]) => {
+  const addReferencePhotoFiles = async (files) => {
     const arr = Array.from(files).filter(f => f.type.startsWith('image/'));
     if (arr.length === 0) return;
     const dataUris = await Promise.all(arr.map(fileToDataUri));
     setReferencePhotoDataUris(prev => [...prev, ...dataUris]);
   };
 
-  const handleReferencePhotoFileInput = (e: any) => {
+  const handleReferencePhotoFileInput = (e) => {
     if (e.target.files) addReferencePhotoFiles(e.target.files);
     e.target.value = '';
   };
 
-  const handleReferencePhotoPaste = (e: any) => {
+  const handleReferencePhotoPaste = (e) => {
     const items = e.clipboardData?.items;
     if (!items) return;
-    const files: File[] = [];
+    const files = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.type && item.type.startsWith('image/')) {
@@ -492,12 +898,12 @@ const handleCreateShoot = async () => {
     }
   };
 
-  const handleReferencePhotoDrop = (e: any) => {
+  const handleReferencePhotoDrop = (e) => {
     e.preventDefault();
     if (e.dataTransfer.files) addReferencePhotoFiles(e.dataTransfer.files);
   };
 
-  const removeReferencePhoto = (idx: number) => {
+  const removeReferencePhoto = (idx) => {
     setReferencePhotoDataUris(prev => prev.filter((_, i) => i !== idx));
   };
 
@@ -533,7 +939,7 @@ const handleCreateShoot = async () => {
       } else {
         alert('Ошибка поиска на сервере: ' + data.error);
       }
-    } catch (err: any) {
+    } catch (err) {
       if (err.name === 'AbortError') {
         alert('Поиск занял больше 10 минут и был прерван. Проверь консоль сервера — там теперь видно, на каком шаге зависло.');
       } else {
@@ -545,11 +951,11 @@ const handleCreateShoot = async () => {
     }
   };
 
-  const toggleSelection = (id: number) => {
+  const toggleSelection = (id) => {
     setSelectedForBase(prev => prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]);
   };
 
-  const openPreview = (result: any) => {
+  const openPreview = (result) => {
     setImgFailed(false);
     setActivePreviewData(result);
   };
@@ -617,159 +1023,34 @@ const handleCreateShoot = async () => {
     .filter(lead => lead.status !== 'Rejected' && lead.niche !== 'Blacklist')
     .filter((lead, index, self) => index === self.findIndex((t) => t.username.toLowerCase() === lead.username.toLowerCase()));
 
-  if (authLoading) return <div style={{ padding: '50px', textAlign: 'center', fontFamily: 'Archivo' }}>Загрузка...</div>;
-
-  // ================= ПУБЛИЧНЫЙ САЙТ ================= //
-  if (!user) {
-    const settings = publicSettings || {
-      tagline: "Сохраняю текстуру кожи и характер кадра. High-end ретушь для брендов и глянца.",
-      facts: [
-        { label: "Опыт", value: "06", note: "лет в постобработке" },
-        { label: "Съёмок", value: "240+", note: "обработано с 2020" },
-        { label: "Тест-ретушь", value: "Free", note: "одно фото бесплатно" }
-      ]
-    };
-
+  if (authLoading) {
     return (
-      <div style={{ background: 'var(--paper)', minHeight: '100vh', color: 'var(--ink)' }}>
-         <style dangerouslySetInnerHTML={{ __html: CSS }} />
-         <header style={{ padding: '24px 56px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--line-soft)' }}>
-           <h2 style={{ fontFamily: 'Archivo', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.16em', margin: 0, fontSize: '18px' }}>Adriana Studio</h2>
-           <button onClick={() => setShowAdminLogin(!showAdminLogin)} style={{ background: 'none', border: 'none', color: 'var(--line)', cursor: 'pointer', fontFamily: 'Archivo', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.2em' }}>Admin</button>
-         </header>
-
-         {showAdminLogin ? (
-           <form onSubmit={handleLogin} style={{ maxWidth: '300px', margin: '150px auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <h3 style={{ fontFamily: 'Archivo', textAlign: 'center', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Вход в CRM</h3>
-              <input type="email" placeholder="Email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)} style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', fontFamily: 'inherit', outline: 'none' }} />
-              <input type="password" placeholder="Пароль" value={loginPassword} onChange={e => setLoginPassword(e.target.value)} style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', fontFamily: 'inherit', outline: 'none' }} />
-              <button type="submit" className="badge solid" style={{ padding: '16px', border: 'none', cursor: 'pointer', fontSize: '12px' }}>Войти</button>
-           </form>
-         ) : (
-           <main>
-             {/* СЕКЦИЯ 1: HERO И ФАКТЫ */}
-             <section style={{ padding: '80px 56px', borderBottom: '1px solid var(--ink)' }}>
-               <h1 className="display" style={{ fontSize: 'clamp(48px, 8vw, 120px)', maxWidth: '14ch', margin: '0 0 40px 0' }}>
-                 post-production & retouching
-               </h1>
-               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '40px', borderTop: '1px solid var(--line-soft)', paddingTop: '40px' }}>
-                 <div style={{ gridColumn: '1 / -1', maxWidth: '600px', marginBottom: '20px' }}>
-                   <p style={{ fontSize: '20px', lineHeight: '1.6', margin: 0 }}>{settings.tagline}</p>
-                 </div>
-                 {settings.facts.map((fact: any, idx: number) => (
-                   <div key={idx}>
-                     <div className="mono-label" style={{ marginBottom: '8px' }}>{fact.label}</div>
-                     <div style={{ fontFamily: 'Archivo', fontSize: '48px', fontWeight: 800, lineHeight: 1, marginBottom: '8px' }}>{fact.value}</div>
-                     <div style={{ fontSize: '13px', color: 'var(--mute)' }}>{fact.note}</div>
-                   </div>
-                 ))}
-               </div>
-             </section>
-
-             {/* СЕКЦИЯ 2: ПОЛЗУНКИ ДО/ПОСЛЕ */}
-             {publicBeforeAfter.length > 0 && (
-               <section style={{ padding: '80px 56px', borderBottom: '1px solid var(--ink)' }}>
-                 <h2 className="display" style={{ fontSize: '48px', marginBottom: '40px' }}>before & after</h2>
-                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: '40px' }}>
-                   {publicBeforeAfter.map(item => (
-                     <div key={item.id}>
-                       <BeforeAfterSlider beforeUrl={item.beforeUrl} afterUrl={item.afterUrl} />
-                       <div style={{ marginTop: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                         <h4 style={{ margin: 0, fontFamily: 'Archivo', fontSize: '14px', textTransform: 'uppercase' }}>{item.title}</h4>
-                         <span style={{ fontSize: '11px', color: 'var(--mute)' }}>{item.note}</span>
-                       </div>
-                     </div>
-                   ))}
-                 </div>
-               </section>
-             )}
-
-             {/* СЕКЦИЯ 3: ЖУРНАЛЬНОЕ ПОРТФОЛИО */}
-             <section style={{ padding: '80px 56px' }} className="sec-portfolio">
-               <h2 className="display" style={{ fontSize: '48px', marginBottom: '60px' }}>selected works</h2>
-               {publicShoots.length === 0 ? (
-                 <p style={{ color: 'var(--mute)' }}>Портфолио пока пусто. Загрузи съёмки через базу данных.</p>
-               ) : (
-                 <div style={{ display: 'flex', flexDirection: 'column', gap: '80px' }}>
-                   {publicShoots.map((shoot, si) => {
-                     const rows = buildRows(shoot.photos || []);
-                     return (
-                       <article className="shoot" key={shoot.id}>
-                         <header className="shoot-head">
-                           <h3 className="shoot-name">{shoot.title}</h3>
-                           <div className="shoot-meta">
-                             <span className="mono-label">{shoot.photos?.length} кадров</span>
-                             <span className="mono-label">{shoot.year}</span>
-                           </div>
-                         </header>
-                         <div className="mosaic">
-                           {rows.map((row, rowIdx) => (
-                             <div key={rowIdx} className={`mrow ${row.single ? 'single' : ''}`} style={{ height: row.h }}>
-                               {row.items.map((it: any) => (
-                                 <figure 
-                                   key={it.idx} 
-                                   className="cell" 
-                                   data-n={String(it.idx + 1).padStart(2, '0')}
-                                   style={{ flex: `${it.flex} 1 0`, height: it.h }}
-                                   onClick={() => openLightbox(shoot, it.idx)}
-                                 >
-                                   <img src={it.photo.url} alt={`${shoot.title} - photo${it.idx}`} loading="lazy" />
-                                 </figure>
-                               ))}
-                             </div>
-                           ))}
-                         </div>
-                       </article>
-                     );
-                   })}
-                 </div>
-               )}
-             </section>
-             
-             {/* САМ ЛАЙТБОКС (ПОПАП С ФОТО) */}
-             <div className={`lb ${lbOpen ? 'on' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) setLbOpen(false) }}>
-               <button className="lb-x" onClick={() => setLbOpen(false)} aria-label="Закрыть">✕</button>
-               <button className="lb-p" onClick={() => setLbIdx((prev) => (prev - 1 + lbList.length) % lbList.length)} aria-label="Назад">‹</button>
-               {lbList.length > 0 && <img src={lbList[lbIdx].url} alt="Увеличенное фото" />}
-               <button className="lb-n" onClick={() => setLbIdx((prev) => (prev + 1) % lbList.length)} aria-label="Вперёд">›</button>
-               <div className="lb-cap">{lbList.length > 0 ? lbList[lbIdx].cap : ''}</div>
-             </div>
-
-             {/* СЕКЦИЯ 4: ФОРМА ЗАЯВКИ */}
-             <section style={{ padding: '80px 56px', background: 'var(--ink)', color: 'var(--paper)' }}>
-               <div style={{ maxWidth: '600px', margin: '0 auto' }}>
-                 <h2 className="display" style={{ fontSize: '48px', marginBottom: '16px', color: 'var(--paper)' }}>send test task</h2>
-                 <p style={{ color: 'var(--mute)', marginBottom: '40px' }}>Прикрепи 1-2 RAW файла и опиши задачу. Я сделаю тестовую ретушь бесплатно, чтобы мы могли оценить мэтч.</p>
-                 
-                 {reqSent ? (
-                   <div style={{ padding: '40px', border: '1px solid var(--paper)', textAlign: 'center' }}>
-                     <h3 style={{ fontFamily: 'Archivo', fontSize: '24px', margin: '0 0 8px' }}>Заявка отправлена! 🤍</h3>
-                     <p style={{ color: 'var(--mute)', margin: 0 }}>Я посмотрю исходники и напишу тебе в ближайшее время.</p>
-                     <button onClick={() => setReqSent(false)} className="badge" style={{ marginTop: '24px', border: '1px solid var(--paper)', color: 'var(--paper)', background: 'transparent', padding: '10px 20px', cursor: 'pointer' }}>Отправить еще</button>
-                   </div>
-                 ) : (
-                   <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                     <input value={reqName} onChange={e => setReqName(e.target.value)} type="text" placeholder="Имя / Бренд *" style={{ padding: '16px', border: '1px solid #333', background: 'transparent', color: 'var(--paper)', outline: 'none', fontFamily: 'inherit' }} />
-                     <input value={reqContact} onChange={e => setReqContact(e.target.value)} type="text" placeholder="Telegram / Instagram / Email *" style={{ padding: '16px', border: '1px solid #333', background: 'transparent', color: 'var(--paper)', outline: 'none', fontFamily: 'inherit' }} />
-                     <textarea value={reqTask} onChange={e => setReqTask(e.target.value)} placeholder="Опиши задачу (референсы, стиль, сроки)" rows={4} style={{ padding: '16px', border: '1px solid #333', background: 'transparent', color: 'var(--paper)', outline: 'none', fontFamily: 'inherit', resize: 'vertical' }} />
-                     
-                     <div style={{ border: '1px dashed #333', padding: '24px', textAlign: 'center', position: 'relative' }}>
-                       <input type="file" multiple accept="image/*,.cr2,.nef,.arw,.dng" onChange={e => setReqFiles(Array.from(e.target.files || []))} style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer' }} />
-                       <div className="badge" style={{ border: '1px solid #333', padding: '8px 16px', color: 'var(--paper)' }}>Выбрать файлы</div>
-                       <p style={{ fontSize: '12px', color: 'var(--mute)', margin: '12px 0 0 0' }}>Файлы для ретуши (до 6 шт). Выбрано: {reqFiles.length}</p>
-                     </div>
-
-                     <button onClick={handleSendRequest} disabled={isSendingReq} className="badge solid" style={{ padding: '18px', border: 'none', background: 'var(--paper)', color: 'var(--ink)', cursor: isSendingReq ? 'wait' : 'pointer', fontSize: '14px', marginTop: '12px' }}>
-                       {isSendingReq ? 'Отправляем... (может занять минуту)' : 'Отправить заявку ➔'}
-                     </button>
-                   </div>
-                 )}
-               </div>
-             </section>
-           </main>
-         )}
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', fontFamily: "'Archivo',sans-serif", fontSize: 11, letterSpacing: '.22em', textTransform: 'uppercase', color: '#7C776E', background: '#F4F2EF' }}>
+        Загрузка…
       </div>
     );
+  }
+
+  // ================= ГОСТЬ: ПОРТФОЛИО ИЛИ ВХОД ================= //
+  if (!user) {
+    if (showAdminLogin) {
+      return (
+        <div className="app">
+          <style dangerouslySetInnerHTML={{ __html: CSS }} />
+          <div className="strip"><span>Adriana Retouch</span><span>Вход для владельца</span></div>
+          <form onSubmit={handleLogin} style={{ maxWidth: 340, margin: '14vh auto', display: 'flex', flexDirection: 'column', gap: 14, padding: '0 24px' }}>
+            <h1 className="display" style={{ fontSize: 34, margin: '0 0 6px' }}>вход в crm</h1>
+            <p className="mono-label" style={{ marginBottom: 10 }}>Только для меня</p>
+            <input type="email" placeholder="Email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)} style={{ padding: 14, border: '1px solid var(--ink)', background: 'transparent', fontFamily: 'inherit', outline: 'none' }} />
+            <input type="password" placeholder="Пароль" value={loginPassword} onChange={e => setLoginPassword(e.target.value)} style={{ padding: 14, border: '1px solid var(--ink)', background: 'transparent', fontFamily: 'inherit', outline: 'none' }} />
+            {loginError && <span style={{ fontSize: 12, color: '#8A3B33' }}>{loginError}</span>}
+            <button type="submit" className="badge solid" style={{ padding: 16, border: 'none', cursor: 'pointer', fontSize: 11 }}>Войти</button>
+            <button type="button" onClick={() => { setShowAdminLogin(false); setLoginError(''); }} style={{ background: 'none', border: 'none', color: 'var(--mute)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline' }}>Вернуться на сайт</button>
+          </form>
+        </div>
+      );
+    }
+    return <PublicSite onAdminClick={() => setShowAdminLogin(true)} />;
   }
 
   // ================= ЗАКРЫТАЯ CRM (АДМИНКА) ================= //
@@ -973,12 +1254,14 @@ const handleCreateShoot = async () => {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Главный экран</h3>
                     <textarea value={editTagline} onChange={e => setEditTagline(e.target.value)} placeholder="Слоган (Tagline)" rows={3} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
-                    <textarea value={editAbout} onChange={e => setEditAbout(e.target.value)} placeholder="Обо мне (каждый абзац с новой строки)" rows={6} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
+                    <textarea value={editAboutNote} onChange={e => setEditAboutNote(e.target.value)} placeholder="Короткая подпись к разделу «Обо мне»" rows={2} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
+                    <textarea value={editAbout} onChange={e => setEditAbout(e.target.value)} placeholder="Обо мне: каждый абзац с новой строки" rows={8} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <button onClick={handleSaveSettings} className="badge solid" style={{ padding: '12px', cursor: 'pointer', border: 'none', width: 'fit-content' }}>Сохранить тексты и контакты</button>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Контакты (Ссылки)</h3>
                     <input value={editTg} onChange={e => setEditTg(e.target.value)} type="text" placeholder="Telegram URL (https://t.me/...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+                    <input value={editWa} onChange={e => setEditWa(e.target.value)} type="text" placeholder="WhatsApp URL (https://wa.me/48...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editIg} onChange={e => setEditIg(e.target.value)} type="text" placeholder="Instagram URL (https://instagram.com/...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editEmail} onChange={e => setEditEmail(e.target.value)} type="text" placeholder="Email (почта@домен.com)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                   </div>
@@ -1208,11 +1491,11 @@ const handleCreateShoot = async () => {
             <input type="text" placeholder="Название (например: Украшения — золото)" value={shootTitle} onChange={e => setShootTitle(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
             
             <select value={shootCategory} onChange={e => setShootCategory(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }}>
-              <option value="beauty">Beauty</option>
-              <option value="lookbook">Lookbook</option>
-              <option value="fashion">Fashion</option>
-              <option value="art">Art</option>
-              <option value="still">Still</option>
+              <option value="beauty">Бьюти</option>
+              <option value="lookbook">Лук бук</option>
+              <option value="fashion">Фешн</option>
+              <option value="art">Творчество</option>
+              <option value="still">Предметка</option>
             </select>
 
             <input type="text" placeholder="Год (необязательно, например: 2026)" value={shootYear} onChange={e => setShootYear(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
@@ -1224,7 +1507,7 @@ const handleCreateShoot = async () => {
 
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateShoot} disabled={isUploading} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploading ? 'wait' : 'pointer' }}>
-                {isUploading ? 'Загрузка... Не закрывай окно' : 'Загрузить в базу 🚀'}
+                {isUploading ? `Загружаю ${uploadStep}… не закрывай окно` : 'Опубликовать на сайте'}
               </button>
               <button onClick={() => setShowAddShoot(false)} disabled={isUploading} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
@@ -1254,7 +1537,7 @@ const handleCreateShoot = async () => {
 
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateBA} disabled={isUploadingBA} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploadingBA ? 'wait' : 'pointer' }}>
-                {isUploadingBA ? 'Загрузка...' : 'Добавить 🚀'}
+                {isUploadingBA ? 'Загрузка…' : 'Добавить'}
               </button>
               <button onClick={() => setShowAddBA(false)} disabled={isUploadingBA} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
@@ -1302,7 +1585,7 @@ const handleCreateShoot = async () => {
                         gridTemplateColumns: activePreviewData.photoUrls.length > 1 ? '1fr 1fr' : '1fr', 
                         gap: '12px', width: '100%', height: '100%', maxHeight: '100%'
                     }}>
-                        {activePreviewData.photoUrls.map((url: string, idx: number) => (
+                        {activePreviewData.photoUrls.map((url, idx) => (
                             <div key={idx} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden', borderRadius: '8px', boxShadow: '0 10px 25px rgba(0,0,0,0.1)' }}>
                                 <img
                                     src={`${API_BASE}/api/image-proxy?url=${encodeURIComponent(url)}`}
@@ -1325,6 +1608,194 @@ const handleCreateShoot = async () => {
   );
 }
 
+/* ═════════════════ СТИЛИ ПУБЛИЧНОГО САЙТА ═════════════════ */
+const SITE_CSS = `:root{
+  --ink:#0B0B0A;
+  --paper:#F4F2EF;
+  --paper-2:#EAE7E2;
+  --line:#D6D2CB;
+  --line-soft:#E2DFD9;
+  --mute:#7C776E;
+  --accent:#A79E90;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+img{display:block;max-width:100%}
+button{font-family:inherit}
+
+.label{font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:var(--mute)}
+.display{font-family:'Archivo',sans-serif;font-weight:800;letter-spacing:-.035em;line-height:.86;text-transform:lowercase}
+.wrap{padding:0 24px}
+@media (min-width:900px){.wrap{padding:0 56px}}
+
+/* ── strip + nav ── */
+.strip{background:var(--ink);color:var(--paper);display:flex;justify-content:space-between;gap:16px;padding:9px 24px;white-space:nowrap;overflow:hidden}
+.strip span{font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:#B9B4AA}
+.strip span:first-child{color:var(--paper)}
+.topnav{position:sticky;top:0;z-index:60;background:rgba(244,242,239,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--ink);display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 24px}
+.brand{display:flex;align-items:center;gap:11px}
+.brand-word{font-family:'Archivo',sans-serif;font-weight:800;font-size:17px;letter-spacing:.16em;text-transform:uppercase}
+.brand-sub{font-family:'Archivo',sans-serif;font-weight:400;font-size:17px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute)}
+.navlinks{display:flex;gap:28px;align-items:center}
+.navlinks a{font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;color:var(--mute);text-decoration:none;transition:color .2s}
+.navlinks a:hover{color:var(--ink)}
+.admin{background:none;border:0;cursor:pointer;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#C9C5BE}
+.admin:hover{color:var(--mute)}
+
+/* ── hero ── */
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:stretch;padding:44px 24px 0}
+.hero-l{display:flex;flex-direction:column;justify-content:space-between;gap:28px}
+.hero-l h1{margin:0}
+.hero-svc{border-top:1px solid var(--ink);display:flex;flex-direction:column}
+.hero-svc div{display:flex;justify-content:space-between;gap:14px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
+.hero-svc div:last-child{border-bottom:0}
+.hero-over{font-family:'Archivo',sans-serif;font-weight:800;text-transform:lowercase;letter-spacing:-.03em;color:rgba(11,11,10,.10);font-size:clamp(26px,4.4vw,58px);line-height:.9;margin-bottom:-1.4vw}
+.hero-main{font-size:clamp(54px,10.6vw,148px)}
+.hero-meta{margin-top:26px;display:flex;flex-direction:column;gap:10px;max-width:38ch}
+.hero-meta p{margin:0;font-size:15px;line-height:1.6;color:#4A463F}
+.hero-cta{margin-top:28px;display:flex;gap:12px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:10px;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;padding:15px 26px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;text-decoration:none;transition:background .25s,color .25s}
+.btn:hover{background:transparent;color:var(--ink)}
+.btn.ghost{background:transparent;color:var(--ink)}
+.btn.ghost:hover{background:var(--ink);color:var(--paper)}
+.hero-img{position:relative}
+.hero-img img{width:100%;height:clamp(360px,52vw,660px);object-fit:cover;object-position:center 22%}
+.hero-img figcaption{display:flex;justify-content:space-between;gap:12px;padding-top:10px}
+@media (max-width:860px){
+  .hero{grid-template-columns:1fr;gap:28px;padding-top:32px}
+  .hero-img img{height:64vw;min-height:320px}
+}
+
+.rule{border-top:1px solid var(--ink);margin:56px 24px 0}
+@media (min-width:900px){.rule{margin:88px 56px 0}}
+.sec{padding:0 24px;scroll-margin-top:78px}
+@media (min-width:900px){.sec{padding:0 56px}}
+.sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;padding:14px 0 36px}
+.sec-num{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;color:var(--accent)}
+.sec-title{margin:8px 0 0;font-size:clamp(34px,5.6vw,64px)}
+.sec-note{max-width:40ch;margin:0;font-size:14px;line-height:1.6;color:var(--mute)}
+
+/* ── about ── */
+.about{display:grid;grid-template-columns:.8fr 1.2fr;gap:48px;align-items:start;padding-bottom:8px}
+.about img{width:100%;aspect-ratio:3/4;object-fit:cover}
+.about-body p{margin:0 0 18px;font-size:16px;line-height:1.7;color:#3C3932;max-width:56ch}
+.facts{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--ink);margin-top:30px}
+.fact{padding:20px 20px 22px;border-right:1px solid var(--line-soft)}
+.fact:first-child{padding-left:0}
+.fact:last-child{border-right:0}
+.fact-v{font-family:'Archivo',sans-serif;font-weight:800;letter-spacing:-.04em;font-size:clamp(30px,3.6vw,46px);line-height:1;margin:14px 0 8px}
+.fact-d{font-size:12px;color:var(--mute)}
+@media (max-width:860px){
+  .about{grid-template-columns:1fr;gap:26px}
+  .facts{grid-template-columns:1fr}
+  .fact{border-right:0;border-bottom:1px solid var(--line-soft);padding:18px 0}
+  .fact:last-child{border-bottom:0}
+}
+
+/* ── categories ── */
+.cats{display:flex;gap:0;overflow-x:auto;border-top:1px solid var(--ink);border-bottom:1px solid var(--line);scrollbar-width:none}
+.cats::-webkit-scrollbar{display:none}
+.cat{background:none;border:0;cursor:pointer;padding:18px 0;margin-right:32px;white-space:nowrap;font-family:'Archivo',sans-serif;font-size:11px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);border-bottom:1px solid transparent;transition:color .25s,border-color .25s}
+.cat:last-child{margin-right:0}
+.cat:hover{color:var(--ink)}
+.cat[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
+.cat .c-num{color:var(--accent);margin-right:8px}
+.cat .c-count{color:var(--accent);margin-left:7px;font-size:9px;vertical-align:super}
+
+/* ── shoots ── */
+.shoot{padding:44px 0 8px;border-bottom:1px solid var(--line-soft)}
+.shoot:last-child{border-bottom:0}
+.shoot-head{display:flex;align-items:baseline;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:22px}
+.shoot-name{font-family:'Archivo',sans-serif;font-weight:600;font-size:clamp(19px,2.2vw,26px);letter-spacing:-.02em;margin:0}
+.shoot-meta{display:flex;gap:20px;align-items:baseline}
+.mosaic{display:flex;flex-direction:column;gap:14px}
+.mrow{display:flex;gap:14px;align-items:flex-start}
+.cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0}
+.cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
+.cell:hover img{transform:scale(1.03)}
+.cell::after{content:attr(data-n);position:absolute;left:10px;bottom:8px;font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.2em;color:#fff;opacity:0;transition:opacity .3s;text-shadow:0 1px 6px rgba(0,0,0,.5)}
+.cell:hover::after{opacity:1}
+@media (max-width:760px){
+  .mrow{flex-wrap:wrap;gap:10px}
+  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
+  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+}
+
+/* ── before / after ── */
+.ba-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
+.ba{border:1px solid var(--line-soft);background:var(--paper-2)}
+.ba-stage{position:relative;user-select:none;touch-action:none;overflow:hidden;aspect-ratio:3/4}
+.ba-stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.ba-after{clip-path:inset(0 0 0 50%)}
+.ba-line{position:absolute;top:0;bottom:0;left:50%;width:1px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
+.ba-knob{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.92);display:flex;align-items:center;justify-content:center;font-family:'Archivo',sans-serif;font-size:12px;letter-spacing:.1em;cursor:ew-resize;box-shadow:0 6px 20px rgba(0,0,0,.2)}
+.ba-tag{position:absolute;bottom:12px;font-family:'Archivo',sans-serif;font-size:9px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;background:rgba(11,11,10,.75);color:#fff;padding:6px 10px}
+.ba-tag.l{left:12px}
+.ba-tag.r{right:12px}
+.ba-cap{display:flex;justify-content:space-between;gap:12px;padding:14px 16px;border-top:1px solid var(--line-soft)}
+@media (max-width:860px){.ba-grid{grid-template-columns:1fr;gap:20px}}
+
+/* ── contacts ── */
+.contacts{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}
+.ch{border-top:1px solid var(--ink)}
+.ch a{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:22px 4px 22px 0;border-bottom:1px solid var(--line-soft);text-decoration:none;color:var(--ink);transition:padding .3s,background .3s}
+.ch a:hover{padding-left:14px;background:var(--paper-2)}
+.ch-name{display:block;font-family:'Archivo',sans-serif;font-weight:600;font-size:17px;letter-spacing:-.01em}
+.ch-sub{display:block;font-size:12px;color:var(--mute);margin-top:5px}
+.ch-arrow{font-family:'Archivo',sans-serif;font-size:15px;color:var(--accent)}
+
+@media (max-width:760px){
+  .strip{justify-content:flex-start;gap:14px}
+  .strip span:nth-child(2),.strip span:nth-child(3){display:none}
+  .topnav{flex-wrap:wrap;gap:12px;padding:14px 20px 0}
+  .brand{flex:1 1 100%}
+  .navlinks{flex:1 1 100%;gap:22px;overflow-x:auto;padding:4px 0 12px;scrollbar-width:none}
+  .navlinks::-webkit-scrollbar{display:none}
+  .navlinks a,.admin{white-space:nowrap}
+  .hero-svc div{flex-direction:column;gap:3px;padding:9px 0}
+  .hero-cta{gap:10px}
+  .hero-cta .btn{flex:1 1 100%;justify-content:center}
+}
+
+/* ── form ── */
+.form{display:flex;flex-direction:column;gap:14px}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.field{display:flex;flex-direction:column;gap:7px}
+.field > span{font-family:'Archivo',sans-serif;font-size:9px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
+input,select,textarea{font-family:'Inter',sans-serif;font-size:14px;color:var(--ink);background:transparent;border:0;border-bottom:1px solid var(--line);padding:11px 2px;outline:none;transition:border-color .25s;border-radius:0;-webkit-appearance:none;appearance:none}
+input:focus,select,textarea:focus{border-color:var(--ink)}
+select{cursor:pointer}
+textarea{resize:vertical;min-height:88px;line-height:1.55}
+.drop{border:1px dashed var(--line);padding:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mute);transition:border-color .25s,background .25s}
+.drop.hot{border-color:var(--ink);background:var(--paper-2)}
+.pick{font-family:'Archivo',sans-serif;font-size:9px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;border:1px solid var(--ink);padding:9px 14px;cursor:pointer;color:var(--ink)}
+.thumbs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;width:100%}
+.thumb{position:relative;width:62px;height:62px}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.thumb button{position:absolute;top:-7px;right:-7px;width:20px;height:20px;border-radius:50%;border:0;background:var(--ink);color:var(--paper);font-size:10px;cursor:pointer;line-height:1}
+.note{font-size:12px;color:var(--mute);line-height:1.55}
+.ok{border:1px solid var(--ink);padding:18px;font-size:14px;line-height:1.6}
+
+footer,.site-footer{margin-top:72px;border-top:1px solid var(--ink);padding:22px 24px 30px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+@media (min-width:900px){footer,.site-footer{padding:22px 56px 34px}}
+@media (max-width:860px){.contacts{grid-template-columns:1fr;gap:34px}.form-row{grid-template-columns:1fr}}
+
+/* ── lightbox ── */
+.lb{position:fixed;inset:0;z-index:100;background:rgba(11,11,10,.94);display:none;align-items:center;justify-content:center;padding:28px}
+.lb.on{display:flex}
+.lb img{max-width:92vw;max-height:82vh;object-fit:contain}
+.lb-x,.lb-p,.lb-n{position:absolute;background:none;border:0;color:#EDEBE6;cursor:pointer;font-family:'Archivo',sans-serif;letter-spacing:.2em;font-size:13px}
+.lb-x{top:22px;right:26px;font-size:20px}
+.lb-p{left:18px;top:50%;transform:translateY(-50%);font-size:26px}
+.lb-n{right:18px;top:50%;transform:translateY(-50%);font-size:26px}
+.lb-cap{position:absolute;bottom:24px;left:0;right:0;text-align:center;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#9A958C}
+/* заглушки, пока фото не загружены */
+.hero-empty{width:100%;height:100%;min-height:340px;background:var(--paper-2);border:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center;text-align:center;padding:24px}
+.about-empty{background:var(--paper-2);border:1px solid var(--line-soft);min-height:420px}
+`;
+
+/* ═════════════════ СТИЛИ CRM ═════════════════ */
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;800&family=Inter:wght@300;400;500&display=swap');
 
