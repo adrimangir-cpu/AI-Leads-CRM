@@ -1,20 +1,5 @@
 "use client";
 
-/* ============================================================
-   ADRIANA RETOUCH — один файл на два состояния:
-   • не авторизован → публичное портфолио (обо мне, категории,
-     каталоги съёмок, до/после, контакты, форма → Telegram)
-   • авторизован    → закрытая CRM и панель управления сайтом
-
-   Firestore:
-     portfolio_shoots     { category, title, year, order, cover, photos:[{url,w,h,path}] }
-     before_after         { title, note, beforeUrl, afterUrl, order }
-     site_settings/public { tagline, aboutNote, about[], facts[], heroUrl, aboutUrl, contacts{} }
-     leads_portfolio      { name, contact, task, message, photosCount, status, createdAt }
-
-   Фото съёмок и до/после лежат в Firebase Storage, в Firestore — только ссылки.
-   ============================================================ */
-
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
 import { db, auth, storage } from '../firebase';
