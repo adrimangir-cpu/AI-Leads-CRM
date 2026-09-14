@@ -32,6 +32,17 @@ const FALLBACK_CONTACTS = {
   email: { handle: 'hello@adriana.studio', url: 'mailto:hello@adriana.studio', sub: 'для брифов и договоров' },
 };
 
+/* Бегущая строка в самом верху публичного сайта */
+const TICKER = [
+  'Кожа остаётся кожей',
+  'Первый кадр — бесплатно',
+  'Beauty · Fashion · Still life',
+  'Отвечаю в тот же день',
+  'Photoshop · Capture One',
+  'PSD со слоями по запросу',
+  'Warsaw / Online',
+];
+
 /* ───────── умная раскладка: съёмка любого объёма → ряды по 1–3 кадра ───────── */
 const ROW_MAP = { 1: [1], 2: [2], 3: [1, 2], 4: [2, 2], 5: [2, 3], 6: [3, 3], 7: [2, 2, 3], 8: [3, 2, 3], 9: [3, 3, 3] };
 function rowsFor(n) {
@@ -295,6 +306,8 @@ function PublicSite({ onAdminClick }) {
   const [cat, setCat] = useState(CATEGORIES[0].id);
   const [lb, setLb] = useState({ list: [], idx: null });
   const [loading, setLoading] = useState(true);
+  const [scrolled, setScrolled] = useState(false); // ушли ниже первого экрана
+  const [menu, setMenu] = useState(false);         // открыто боковое меню
 
   useEffect(() => {
     (async () => {
@@ -314,6 +327,22 @@ function PublicSite({ onAdminClick }) {
       }
     })();
   }, []);
+
+  /* верхняя панель уезжает, вместо неё — кнопка бокового меню */
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 170);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  /* при открытом меню страница под ним не скроллится */
+  useEffect(() => {
+    document.body.style.overflow = menu ? 'hidden' : '';
+    const onKey = (e) => { if (e.key === 'Escape') setMenu(false); };
+    window.addEventListener('keydown', onKey);
+    return () => { document.body.style.overflow = ''; window.removeEventListener('keydown', onKey); };
+  }, [menu]);
 
   const counts = useMemo(() => {
     const m = {};
@@ -342,6 +371,14 @@ function PublicSite({ onAdminClick }) {
   const aboutPhoto = settings?.aboutUrl || '';
   const year = new Date().getFullYear();
 
+  const nav = [
+    ['#about', 'Обо мне'],
+    ['#work', 'Портфолио'],
+    ...(ba.length > 0 ? [['#ba', 'До / после']] : []),
+    ['#contact', 'Контакты'],
+    ['#form', 'Тест-ретушь'],
+  ];
+
   const openLb = (shoot, idx) => setLb({
     list: shoot.photos.map((p, i) => ({ url: p.url, cap: `${shoot.title} — ${i + 1} / ${shoot.photos.length}` })),
     idx,
@@ -351,10 +388,17 @@ function PublicSite({ onAdminClick }) {
     <>
       <style dangerouslySetInnerHTML={{ __html: SITE_CSS }} />
 
-      <div className="strip">
-        <span>Приём фото на тест-ретушь открыт</span>
-        <span>Beauty · Fashion · Still life</span>
-        <span>Warsaw · Online</span>
+      {/* бегущая строка вместо статичной плашки */}
+      <div className="ticker" aria-hidden="true">
+        <div className="ticker-track">
+          {[0, 1].map((k) => (
+            <div className="ticker-row" key={k}>
+              {TICKER.map((t, i) => (
+                <span key={i}>{t}<i>/</i></span>
+              ))}
+            </div>
+          ))}
+        </div>
       </div>
 
       <nav className="topnav">
@@ -367,42 +411,66 @@ function PublicSite({ onAdminClick }) {
           <div><span className="brand-word">Adriana</span> <span className="brand-sub">Retouch</span></div>
         </div>
         <div className="navlinks">
-          <a href="#about">Обо мне</a>
-          <a href="#work">Портфолио</a>
-          {ba.length > 0 && <a href="#ba">До / после</a>}
-          <a href="#contact">Контакты</a>
+          {nav.map(([href, label]) => <a key={href} href={href}>{label}</a>)}
           <button className="admin" onClick={onAdminClick}>Admin</button>
         </div>
+        <button className="nav-burger" onClick={() => setMenu(true)} aria-label="Открыть меню">
+          <span /><span /><span />
+        </button>
       </nav>
+
+      {/* кнопка меню появляется, когда верхняя панель уехала вверх */}
+      <button
+        className={`menu-btn ${scrolled && !menu ? 'on' : ''}`}
+        onClick={() => setMenu(true)}
+        aria-label="Открыть меню"
+      >
+        <span /><span /><span />
+      </button>
+
+      <div className={`drawer-bg ${menu ? 'on' : ''}`} onClick={() => setMenu(false)} />
+      <aside className={`drawer ${menu ? 'on' : ''}`} aria-hidden={!menu}>
+        <div className="drawer-top">
+          <span className="label">Меню</span>
+          <button className="drawer-x" onClick={() => setMenu(false)} aria-label="Закрыть меню">✕</button>
+        </div>
+        <nav className="drawer-nav">
+          {nav.map(([href, label], i) => (
+            <a key={href} href={href} onClick={() => setMenu(false)}>
+              <span className="d-num">{String(i + 1).padStart(2, '0')}</span>{label}
+            </a>
+          ))}
+        </nav>
+        <div className="drawer-foot">
+          <a href="#form" className="btn" onClick={() => setMenu(false)}>Фото на тест <span>→</span></a>
+          <button className="drawer-admin" onClick={() => { setMenu(false); onAdminClick(); }}>Admin</button>
+        </div>
+      </aside>
 
       <section className="hero">
         <div className="hero-l">
-          <div className="hero-svc">
-            <div><span className="label">01 — Beauty</span><span className="label">портрет, макро, косметика</span></div>
-            <div><span className="label">02 — Fashion</span><span className="label">лукбуки, кампании, редакции</span></div>
-            <div><span className="label">03 — Still life</span><span className="label">украшения, парфюм, предметка</span></div>
+          <div className="hero-over">post-production</div>
+          <h1 className="display hero-main">adriana</h1>
+          <div className="hero-meta">
+            <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
+            <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
           </div>
-          <div>
-            <div className="hero-over">post-production</div>
-            <h1 className="display hero-main">adriana</h1>
-            <div className="hero-meta">
-              <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
-              <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
-            </div>
-            <div className="hero-cta">
-              <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
-              <a href="#work" className="btn ghost">Смотреть работы</a>
-            </div>
+          <div className="hero-cta">
+            <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
+            <a href="#work" className="btn ghost">Смотреть работы</a>
           </div>
+          <p className="hero-hint">Первый кадр обрабатываю бесплатно — чтобы ты увидела подход до заказа.</p>
         </div>
         <figure className="hero-img">
-          {heroPhoto ? <img src={heroPhoto} alt="Бьюти-портрет после ретуши" /> : <div className="hero-empty"><span className="label">Загрузи первую съёмку в дашборде</span></div>}
+          {heroPhoto
+            ? <img src={heroPhoto} alt="Бьюти-портрет после ретуши" />
+            : <div className="hero-empty"><span className="label">Загрузи первую съёмку в дашборде</span></div>}
           <figcaption><span className="label">Beauty · {year}</span><span className="label">— 001</span></figcaption>
         </figure>
       </section>
 
-      <div className="rule" />
-      <section className="sec" id="about">
+      {/* ── 01 обо мне: тёплый серый фон ── */}
+      <section className="sec tone" id="about">
         <div className="sec-head">
           <div>
             <div className="sec-num">01 — about</div>
@@ -418,20 +486,21 @@ function PublicSite({ onAdminClick }) {
               'Главный принцип — кожа должна остаться кожей. Никакого пластика и «замыленных» лиц: я убираю лишнее, но оставляю поры, родинки и характер.',
               'Работаю в Photoshop и Capture One, отдаю PSD со слоями по запросу. Средний срок — 1–2 дня на портрет, 5–7 дней на съёмку.',
             ]).map((p, i) => <p key={i}>{p}</p>)}
-            <div className="facts">
-              {facts.map((f, i) => (
-                <div className="fact" key={i}>
-                  <div className="label">{f.label}</div>
-                  <div className="fact-v">{f.value}</div>
-                  <div className="fact-d">{f.note}</div>
-                </div>
-              ))}
-            </div>
           </div>
+        </div>
+        {/* цифры на чёрном — визуальная пауза между блоками текста */}
+        <div className="factband">
+          {facts.map((f, i) => (
+            <div className="fact" key={i}>
+              <div className="label">{f.label}</div>
+              <div className="fact-v">{f.value}</div>
+              <div className="fact-d">{f.note}</div>
+            </div>
+          ))}
         </div>
       </section>
 
-      <div className="rule" />
+      {/* ── 02 портфолио ── */}
       <section className="sec" id="work">
         <div className="sec-head">
           <div>
@@ -443,7 +512,13 @@ function PublicSite({ onAdminClick }) {
 
         <div className="cats" role="tablist">
           {CATEGORIES.map((c) => (
-            <button key={c.id} className="cat" role="tab" aria-selected={c.id === cat} onClick={(e) => { setCat(c.id); e.currentTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' }); }}>
+            <button
+              key={c.id}
+              className="cat"
+              role="tab"
+              aria-selected={c.id === cat}
+              onClick={(e) => { setCat(c.id); e.currentTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' }); }}
+            >
               <span className="c-num">{c.num}</span>{c.label}<span className="c-count">{counts[c.id] || 0}</span>
             </button>
           ))}
@@ -486,58 +561,83 @@ function PublicSite({ onAdminClick }) {
         ))}
       </section>
 
+      {/* ── 03 до / после: на чёрном фото читаются лучше всего ── */}
       {ba.length > 0 && (
-        <>
-          <div className="rule" />
-          <section className="sec" id="ba">
-            <div className="sec-head">
-              <div>
-                <div className="sec-num">03 — before / after</div>
-                <h2 className="display sec-title">до / после</h2>
-              </div>
-              <p className="sec-note">Потяни ползунок. Слева — кадр из камеры, справа — после моей обработки.</p>
+        <section className="sec inv" id="ba">
+          <div className="sec-head">
+            <div>
+              <div className="sec-num">03 — before / after</div>
+              <h2 className="display sec-title">до / после</h2>
             </div>
-            <div className="ba-grid">
-              {ba.map((item) => <BeforeAfter key={item.id} item={item} />)}
-            </div>
-          </section>
-        </>
+            <p className="sec-note">Потяни ползунок. Слева — кадр из камеры, справа — после моей обработки.</p>
+          </div>
+          <div className="ba-grid">
+            {ba.map((item) => <BeforeAfter key={item.id} item={item} />)}
+          </div>
+        </section>
       )}
 
-      <div className="rule" />
-      <section className="sec" id="contact">
+      {/* ── 04 контакты: карточки мессенджеров ── */}
+      <section className="sec tone" id="contact">
         <div className="sec-head">
           <div>
             <div className="sec-num">04 — contact</div>
             <h2 className="display sec-title">связаться</h2>
           </div>
-          <p className="sec-note">Выбери удобный мессенджер — откроется сразу диалог. Или заполни форму: сообщение и фото придут мне в Telegram.</p>
+          <p className="sec-note">Нажми на удобный мессенджер — откроется сразу диалог со мной.</p>
         </div>
-        <div className="contacts">
-          <div className="ch">
-            {[
-              ['Telegram', contacts.telegram],
-              ['WhatsApp', contacts.whatsapp],
-              ['Instagram', contacts.instagram],
-              ['Почта', contacts.email],
-            ].filter(([, v]) => v && v.url).map(([name, v]) => (
-              <a key={name} href={v.url} target={v.url.startsWith('mailto') ? undefined : '_blank'} rel="noopener noreferrer">
-                <span>
-                  <span className="ch-name">{name}</span>
-                  <span className="ch-sub">{v.handle}{v.sub ? ` · ${v.sub}` : ''}</span>
-                </span>
-                <span className="ch-arrow">↗</span>
-              </a>
-            ))}
-          </div>
-          <div id="form"><LeadForm /></div>
+        <div className="chgrid">
+          {[
+            ['Telegram', contacts.telegram],
+            ['WhatsApp', contacts.whatsapp],
+            ['Instagram', contacts.instagram],
+            ['Почта', contacts.email],
+          ].filter(([, v]) => v && v.url).map(([name, v]) => (
+            <a key={name} href={v.url} target={v.url.startsWith('mailto') ? undefined : '_blank'} rel="noopener noreferrer">
+              <span className="ch-name">{name}</span>
+              <span className="ch-sub">{v.handle}{v.sub ? ` · ${v.sub}` : ''}</span>
+              <span className="ch-arrow">↗</span>
+            </a>
+          ))}
         </div>
       </section>
 
-      <footer className="site-footer">
+      {/* ── 05 тест-ретушь: главный блок, на чёрном ── */}
+      <section className="sec inv" id="form">
+        <div className="sec-head">
+          <div>
+            <div className="sec-num">05 — test</div>
+            <h2 className="display sec-title">фото на тест</h2>
+          </div>
+          <p className="sec-note">Один кадр — бесплатно. Напиши пару слов, приложи фото, и заявка придёт мне в Telegram.</p>
+        </div>
+        <div className="testgrid">
+          <div className="steps">
+            {[
+              ['01', 'Приложи кадр', 'JPEG или PNG прямо с телефона — можно несколько.'],
+              ['02', 'Опиши задачу', 'Что важно сохранить, для чего съёмка и к какому сроку.'],
+              ['03', 'Получи результат', 'Отвечаю в указанный контакт, обычно в тот же день.'],
+            ].map(([n, t, d]) => (
+              <div className="step" key={n}>
+                <span className="label">{n}</span>
+                <div>
+                  <div className="step-t">{t}</div>
+                  <div className="step-d">{d}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="testform"><LeadForm /></div>
+        </div>
+      </section>
+
+      <footer className="site-footer inv">
         <span className="label">© {year} Adriana Retouch</span>
         <span className="label">Beauty · Fashion · Still life</span>
       </footer>
+
+      {/* мобильная кнопка внизу: тест-ретушь всегда в одном касании */}
+      <a href="#form" className={`mob-cta ${scrolled ? 'on' : ''}`}>Фото на тест — бесплатно <span>→</span></a>
 
       <Lightbox
         list={lb.list}
@@ -1614,11 +1714,34 @@ button{font-family:inherit}
 .wrap{padding:0 24px}
 @media (min-width:900px){.wrap{padding:0 56px}}
 
-/* ── strip + nav ── */
-.strip{background:var(--ink);color:var(--paper);display:flex;justify-content:space-between;gap:16px;padding:9px 24px;white-space:nowrap;overflow:hidden}
-.strip span{font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:#B9B4AA}
-.strip span:first-child{color:var(--paper)}
-.topnav{position:sticky;top:0;z-index:60;background:rgba(244,242,239,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--ink);display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 24px}
+/* ── инверсия: тёмные секции. Переопределяем переменные — всё внутри подстраивается ── */
+.inv{
+  --ink:#F4F2EF;
+  --paper:#0B0B0A;
+  --paper-2:#151412;
+  --line:#3B3833;
+  --line-soft:#2A2825;
+  --mute:#9A958C;
+  --accent:#A79E90;
+  background:#0B0B0A;
+  color:#F4F2EF;
+}
+.inv ::placeholder{color:#6F6A63}
+.inv select option{background:#151412;color:#F4F2EF}
+
+/* ── бегущая строка ── */
+.ticker{background:var(--ink);overflow:hidden;white-space:nowrap}
+.ticker-track{display:flex;width:max-content;animation:tick 38s linear infinite}
+.ticker-row{display:flex}
+.ticker-row span{display:inline-flex;align-items:center;padding:10px 0;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:#EDEBE6}
+.ticker-row i{font-style:normal;color:var(--accent);padding:0 20px}
+.ticker:hover .ticker-track{animation-play-state:paused}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@media (prefers-reduced-motion:reduce){.ticker-track{animation:none}}
+
+/* ── верхняя панель: уезжает вместе со страницей ── */
+.topnav{position:relative;z-index:40;background:var(--paper);border-bottom:1px solid var(--ink);display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 24px}
+@media (min-width:900px){.topnav{padding:16px 56px}}
 .brand{display:flex;align-items:center;gap:11px}
 .brand-word{font-family:'Archivo',sans-serif;font-weight:800;font-size:17px;letter-spacing:.16em;text-transform:uppercase}
 .brand-sub{font-family:'Archivo',sans-serif;font-weight:400;font-size:17px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute)}
@@ -1627,58 +1750,73 @@ button{font-family:inherit}
 .navlinks a:hover{color:var(--ink)}
 .admin{background:none;border:0;cursor:pointer;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#C9C5BE}
 .admin:hover{color:var(--mute)}
+.nav-burger{display:none}
+
+/* ── плавающая кнопка меню ── */
+.menu-btn{position:fixed;top:16px;right:16px;z-index:90;width:48px;height:48px;border:0;background:var(--ink);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;opacity:0;transform:translateY(-14px);pointer-events:none;transition:opacity .3s,transform .3s}
+.menu-btn.on{opacity:1;transform:translateY(0);pointer-events:auto}
+.menu-btn span{display:block;width:18px;height:1px;background:#F4F2EF;transition:width .25s}
+.menu-btn:hover span:nth-child(2){width:11px}
+
+/* ── боковое меню ── */
+.drawer-bg{position:fixed;inset:0;z-index:95;background:rgba(11,11,10,.5);opacity:0;pointer-events:none;transition:opacity .3s}
+.drawer-bg.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:96;width:min(88vw,360px);background:#0B0B0A;color:#F4F2EF;display:flex;flex-direction:column;justify-content:space-between;padding:22px 26px 28px;transform:translateX(102%);transition:transform .38s cubic-bezier(.2,.7,.2,1)}
+.drawer.on{transform:translateX(0)}
+.drawer-top{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2A2825;padding-bottom:16px}
+.drawer-top .label{color:#8E8981}
+.drawer-x{background:none;border:0;color:#F4F2EF;font-size:17px;cursor:pointer;line-height:1}
+.drawer-nav{display:flex;flex-direction:column;margin-top:8px}
+.drawer-nav a{display:flex;align-items:baseline;gap:14px;padding:18px 0;border-bottom:1px solid #1F1E1B;text-decoration:none;color:#F4F2EF;font-family:'Archivo',sans-serif;font-weight:600;font-size:22px;letter-spacing:-.02em;transition:padding-left .25s,color .25s}
+.drawer-nav a:hover{padding-left:8px;color:#C9C5BE}
+.drawer-nav .d-num{font-family:'Archivo',sans-serif;font-weight:500;font-size:10px;letter-spacing:.2em;color:var(--accent)}
+.drawer-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.drawer-foot .btn{background:#F4F2EF;color:#0B0B0A;border-color:#F4F2EF}
+.drawer-foot .btn:hover{background:transparent;color:#F4F2EF}
+.drawer-admin{background:none;border:0;cursor:pointer;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#6F6A63}
+.drawer-admin:hover{color:#F4F2EF}
 
 /* ── hero ── */
-.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:stretch;padding:44px 24px 0}
-.hero-l{display:flex;flex-direction:column;justify-content:space-between;gap:28px}
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center;padding:52px 24px 64px}
+@media (min-width:900px){.hero{padding:64px 56px 84px}}
+.hero-l{display:flex;flex-direction:column}
 .hero-l h1{margin:0}
-.hero-svc{border-top:1px solid var(--ink);display:flex;flex-direction:column}
-.hero-svc div{display:flex;justify-content:space-between;gap:14px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
-.hero-svc div:last-child{border-bottom:0}
 .hero-over{font-family:'Archivo',sans-serif;font-weight:800;text-transform:lowercase;letter-spacing:-.03em;color:rgba(11,11,10,.10);font-size:clamp(26px,4.4vw,58px);line-height:.9;margin-bottom:-1.4vw}
 .hero-main{font-size:clamp(54px,10.6vw,148px)}
 .hero-meta{margin-top:26px;display:flex;flex-direction:column;gap:10px;max-width:38ch}
+.hero-meta .label{line-height:1.7}
 .hero-meta p{margin:0;font-size:15px;line-height:1.6;color:#4A463F}
 .hero-cta{margin-top:28px;display:flex;gap:12px;flex-wrap:wrap}
+.hero-hint{margin:16px 0 0;font-size:12px;line-height:1.55;color:var(--mute);max-width:36ch}
 .btn{display:inline-flex;align-items:center;gap:10px;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;padding:15px 26px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer;text-decoration:none;transition:background .25s,color .25s}
 .btn:hover{background:transparent;color:var(--ink)}
 .btn.ghost{background:transparent;color:var(--ink)}
 .btn.ghost:hover{background:var(--ink);color:var(--paper)}
-.hero-img{position:relative}
+.hero-img{position:relative;margin:0}
 .hero-img img{width:100%;height:clamp(360px,52vw,660px);object-fit:cover;object-position:center 22%}
 .hero-img figcaption{display:flex;justify-content:space-between;gap:12px;padding-top:10px}
-@media (max-width:860px){
-  .hero{grid-template-columns:1fr;gap:28px;padding-top:32px}
-  .hero-img img{height:64vw;min-height:320px}
-}
 
-.rule{border-top:1px solid var(--ink);margin:56px 24px 0}
-@media (min-width:900px){.rule{margin:88px 56px 0}}
-.sec{padding:0 24px;scroll-margin-top:78px}
-@media (min-width:900px){.sec{padding:0 56px}}
-.sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;padding:14px 0 36px}
+/* ── секции ── */
+.sec{padding:64px 24px 72px;scroll-margin-top:12px}
+@media (min-width:900px){.sec{padding:88px 56px 96px}}
+.sec.tone{background:var(--paper-2)}
+.sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;padding:0 0 36px}
 .sec-num{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;color:var(--accent)}
 .sec-title{margin:8px 0 0;font-size:clamp(34px,5.6vw,64px)}
 .sec-note{max-width:40ch;margin:0;font-size:14px;line-height:1.6;color:var(--mute)}
 
-/* ── about ── */
-.about{display:grid;grid-template-columns:.8fr 1.2fr;gap:48px;align-items:start;padding-bottom:8px}
-.about img{width:100%;aspect-ratio:3/4;object-fit:cover}
+/* ── обо мне ── */
+.about{display:grid;grid-template-columns:.8fr 1.2fr;gap:48px;align-items:start}
+.about img{width:100%;aspect-ratio:4/5;object-fit:cover}
 .about-body p{margin:0 0 18px;font-size:16px;line-height:1.7;color:#3C3932;max-width:56ch}
-.facts{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--ink);margin-top:30px}
-.fact{padding:20px 20px 22px;border-right:1px solid var(--line-soft)}
-.fact:first-child{padding-left:0}
-.fact:last-child{border-right:0}
+.factband{display:grid;grid-template-columns:repeat(3,1fr);background:var(--ink);color:#F4F2EF;margin-top:44px}
+.factband .fact{padding:26px 26px 30px;border-right:1px solid #2A2825}
+.factband .fact:last-child{border-right:0}
+.factband .label{color:#8E8981}
 .fact-v{font-family:'Archivo',sans-serif;font-weight:800;letter-spacing:-.04em;font-size:clamp(30px,3.6vw,46px);line-height:1;margin:14px 0 8px}
-.fact-d{font-size:12px;color:var(--mute)}
-@media (max-width:860px){
-  .about{grid-template-columns:1fr;gap:26px}
-  .facts{grid-template-columns:1fr}
-  .fact{border-right:0;border-bottom:1px solid var(--line-soft);padding:18px 0}
-  .fact:last-child{border-bottom:0}
-}
+.fact-d{font-size:12px;color:#9A958C}
 
-/* ── categories ── */
+/* ── категории ── */
 .cats{display:flex;gap:0;overflow-x:auto;border-top:1px solid var(--ink);border-bottom:1px solid var(--line);scrollbar-width:none}
 .cats::-webkit-scrollbar{display:none}
 .cat{background:none;border:0;cursor:pointer;padding:18px 0;margin-right:32px;white-space:nowrap;font-family:'Archivo',sans-serif;font-size:11px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:var(--mute);border-bottom:1px solid transparent;transition:color .25s,border-color .25s}
@@ -1688,7 +1826,7 @@ button{font-family:inherit}
 .cat .c-num{color:var(--accent);margin-right:8px}
 .cat .c-count{color:var(--accent);margin-left:7px;font-size:9px;vertical-align:super}
 
-/* ── shoots ── */
+/* ── съёмки ── */
 .shoot{padding:44px 0 8px;border-bottom:1px solid var(--line-soft)}
 .shoot:last-child{border-bottom:0}
 .shoot-head{display:flex;align-items:baseline;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:22px}
@@ -1696,60 +1834,48 @@ button{font-family:inherit}
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
-.cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0}
+.cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0;margin:0}
 .cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
 .cell::after{content:attr(data-n);position:absolute;left:10px;bottom:8px;font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.2em;color:#fff;opacity:0;transition:opacity .3s;text-shadow:0 1px 6px rgba(0,0,0,.5)}
 .cell:hover::after{opacity:1}
-@media (max-width:760px){
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
-  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
-}
 
-/* ── before / after ── */
+/* ── до / после ── */
 .ba-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
-.ba{border:1px solid var(--line-soft);background:var(--paper-2)}
+.ba{border:1px solid var(--line);background:var(--paper-2)}
 .ba-stage{position:relative;user-select:none;touch-action:none;overflow:hidden;aspect-ratio:3/4}
 .ba-stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .ba-after{clip-path:inset(0 0 0 50%)}
 .ba-line{position:absolute;top:0;bottom:0;left:50%;width:1px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
-.ba-knob{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.92);display:flex;align-items:center;justify-content:center;font-family:'Archivo',sans-serif;font-size:12px;letter-spacing:.1em;cursor:ew-resize;box-shadow:0 6px 20px rgba(0,0,0,.2)}
+.ba-knob{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:46px;height:46px;border-radius:50%;background:rgba(255,255,255,.92);color:#0B0B0A;display:flex;align-items:center;justify-content:center;font-family:'Archivo',sans-serif;font-size:12px;letter-spacing:.1em;cursor:ew-resize;box-shadow:0 6px 20px rgba(0,0,0,.2)}
 .ba-tag{position:absolute;bottom:12px;font-family:'Archivo',sans-serif;font-size:9px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;background:rgba(11,11,10,.75);color:#fff;padding:6px 10px}
 .ba-tag.l{left:12px}
 .ba-tag.r{right:12px}
-.ba-cap{display:flex;justify-content:space-between;gap:12px;padding:14px 16px;border-top:1px solid var(--line-soft)}
-@media (max-width:860px){.ba-grid{grid-template-columns:1fr;gap:20px}}
+.ba-cap{display:flex;justify-content:space-between;gap:12px;padding:14px 16px;border-top:1px solid var(--line)}
 
-/* ── contacts ── */
-.contacts{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}
-.ch{border-top:1px solid var(--ink)}
-.ch a{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:22px 4px 22px 0;border-bottom:1px solid var(--line-soft);text-decoration:none;color:var(--ink);transition:padding .3s,background .3s}
-.ch a:hover{padding-left:14px;background:var(--paper-2)}
-.ch-name{display:block;font-family:'Archivo',sans-serif;font-weight:600;font-size:17px;letter-spacing:-.01em}
-.ch-sub{display:block;font-size:12px;color:var(--mute);margin-top:5px}
-.ch-arrow{font-family:'Archivo',sans-serif;font-size:15px;color:var(--accent)}
+/* ── контакты: карточки ── */
+.chgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}
+.chgrid a{position:relative;background:var(--paper-2);padding:28px 26px 30px;text-decoration:none;color:var(--ink);display:block;transition:background .25s}
+.chgrid a:hover{background:var(--paper)}
+.ch-name{display:block;font-family:'Archivo',sans-serif;font-weight:600;font-size:19px;letter-spacing:-.01em}
+.ch-sub{display:block;font-size:12px;color:var(--mute);margin-top:7px}
+.ch-arrow{position:absolute;top:24px;right:24px;font-family:'Archivo',sans-serif;font-size:15px;color:var(--accent)}
 
-@media (max-width:760px){
-  .strip{justify-content:flex-start;gap:14px}
-  .strip span:nth-child(2),.strip span:nth-child(3){display:none}
-  .topnav{flex-wrap:wrap;gap:12px;padding:14px 20px 0}
-  .brand{flex:1 1 100%}
-  .navlinks{flex:1 1 100%;gap:22px;overflow-x:auto;padding:4px 0 12px;scrollbar-width:none}
-  .navlinks::-webkit-scrollbar{display:none}
-  .navlinks a,.admin{white-space:nowrap}
-  .hero-svc div{flex-direction:column;gap:3px;padding:9px 0}
-  .hero-cta{gap:10px}
-  .hero-cta .btn{flex:1 1 100%;justify-content:center}
-}
+/* ── тест-ретушь ── */
+.testgrid{display:grid;grid-template-columns:.85fr 1.15fr;gap:52px;align-items:start}
+.steps{border-top:1px solid var(--line)}
+.step{display:flex;gap:16px;padding:20px 0;border-bottom:1px solid var(--line-soft)}
+.step:last-child{border-bottom:0}
+.step-t{font-family:'Archivo',sans-serif;font-weight:600;font-size:16px;letter-spacing:-.01em}
+.step-d{font-size:13px;line-height:1.6;color:var(--mute);margin-top:6px;max-width:34ch}
 
-/* ── form ── */
+/* ── форма ── */
 .form{display:flex;flex-direction:column;gap:14px}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .field{display:flex;flex-direction:column;gap:7px}
 .field > span{font-family:'Archivo',sans-serif;font-size:9px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
 input,select,textarea{font-family:'Inter',sans-serif;font-size:14px;color:var(--ink);background:transparent;border:0;border-bottom:1px solid var(--line);padding:11px 2px;outline:none;transition:border-color .25s;border-radius:0;-webkit-appearance:none;appearance:none}
-input:focus,select,textarea:focus{border-color:var(--ink)}
+input:focus,select:focus,textarea:focus{border-color:var(--ink)}
 select{cursor:pointer}
 textarea{resize:vertical;min-height:88px;line-height:1.55}
 .drop{border:1px dashed var(--line);padding:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--mute);transition:border-color .25s,background .25s}
@@ -1760,13 +1886,16 @@ textarea{resize:vertical;min-height:88px;line-height:1.55}
 .thumb img{width:100%;height:100%;object-fit:cover}
 .thumb button{position:absolute;top:-7px;right:-7px;width:20px;height:20px;border-radius:50%;border:0;background:var(--ink);color:var(--paper);font-size:10px;cursor:pointer;line-height:1}
 .note{font-size:12px;color:var(--mute);line-height:1.55}
-.ok{border:1px solid var(--ink);padding:18px;font-size:14px;line-height:1.6}
+.ok{border:1px solid var(--ink);padding:22px;font-size:14px;line-height:1.6}
 
-footer,.site-footer{margin-top:72px;border-top:1px solid var(--ink);padding:22px 24px 30px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-@media (min-width:900px){footer,.site-footer{padding:22px 56px 34px}}
-@media (max-width:860px){.contacts{grid-template-columns:1fr;gap:34px}.form-row{grid-template-columns:1fr}}
+/* ── подвал ── */
+footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+@media (min-width:900px){footer,.site-footer{padding:26px 56px 40px}}
 
-/* ── lightbox ── */
+/* ── мобильная кнопка тест-ретуши ── */
+.mob-cta{display:none}
+
+/* ── просмотр фото ── */
 .lb{position:fixed;inset:0;z-index:100;background:rgba(11,11,10,.94);display:none;align-items:center;justify-content:center;padding:28px}
 .lb.on{display:flex}
 .lb img{max-width:92vw;max-height:82vh;object-fit:contain}
@@ -1775,9 +1904,42 @@ footer,.site-footer{margin-top:72px;border-top:1px solid var(--ink);padding:22px
 .lb-p{left:18px;top:50%;transform:translateY(-50%);font-size:26px}
 .lb-n{right:18px;top:50%;transform:translateY(-50%);font-size:26px}
 .lb-cap{position:absolute;bottom:24px;left:0;right:0;text-align:center;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#9A958C}
+
 /* заглушки, пока фото не загружены */
 .hero-empty{width:100%;height:100%;min-height:340px;background:var(--paper-2);border:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center;text-align:center;padding:24px}
 .about-empty{background:var(--paper-2);border:1px solid var(--line-soft);min-height:420px}
+
+/* ── планшет ── */
+@media (max-width:860px){
+  .hero{grid-template-columns:1fr;gap:28px}
+  .about{grid-template-columns:1fr;gap:26px}
+  .ba-grid{grid-template-columns:1fr;gap:20px}
+  .chgrid{grid-template-columns:1fr}
+  .testgrid{grid-template-columns:1fr;gap:34px}
+  .form-row{grid-template-columns:1fr}
+  .factband{grid-template-columns:1fr}
+  .factband .fact{border-right:0;border-bottom:1px solid #2A2825;padding:20px 22px 24px}
+  .factband .fact:last-child{border-bottom:0}
+}
+
+/* ── телефон ── */
+@media (max-width:760px){
+  .navlinks{display:none}
+  .nav-burger{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;width:40px;height:40px;border:1px solid var(--ink);background:transparent;cursor:pointer}
+  .nav-burger span{display:block;width:16px;height:1px;background:var(--ink)}
+  .hero{padding-top:36px;padding-bottom:44px}
+  .hero-img{display:none}          /* большое фото на телефоне убрано */
+  .hero-cta{gap:10px}
+  .hero-cta .btn{flex:1 1 100%;justify-content:center}
+  .sec{padding:52px 20px 58px}
+  .sec-head{padding-bottom:26px}
+  .mrow{flex-wrap:wrap;gap:10px}
+  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
+  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+  .site-footer{padding-bottom:96px}
+  .mob-cta{display:flex;position:fixed;left:14px;right:14px;bottom:14px;z-index:88;align-items:center;justify-content:center;gap:10px;padding:16px;background:#0B0B0A;color:#F4F2EF;text-decoration:none;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;box-shadow:0 10px 30px rgba(11,11,10,.25);transform:translateY(140%);transition:transform .35s cubic-bezier(.2,.7,.2,1)}
+  .mob-cta.on{transform:translateY(0)}
+}
 `;
 
 /* ═════════════════ СТИЛИ CRM ═════════════════ */
@@ -1906,6 +2068,6 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
   .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
   .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
   .hero-main { font-size: 14vw !important; }
-} 
-
+}
+  
 `;
