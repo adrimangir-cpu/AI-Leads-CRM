@@ -892,16 +892,16 @@ export default function Home() {
   const formData = new FormData();
   formData.append('image', file);
   
-  const apiKey = process.env.NEXT_PUBLIC_IMGBB_KEY; 
-  const res = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
+  // Отправляем фото на наш безопасный Vercel-сервер (он обойдет блокировку)
+  const res = await fetch('/api/upload', {
     method: 'POST',
     body: formData
   });
   
   const data = await res.json();
-  if (!data.success) throw new Error(data.error?.message || 'Не удалось загрузить фото');
+  if (data.error) throw new Error(data.error);
   
-  return data.data.url; 
+  return data.url; 
 };
 
 
