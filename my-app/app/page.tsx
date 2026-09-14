@@ -718,6 +718,7 @@ export default function Home() {
   const [baBefore, setBaBefore] = useState(null);
   const [baAfter, setBaAfter] = useState(null);
   const [isUploadingBA, setIsUploadingBA] = useState(false);
+  const [aboutFile, setAboutFile] = useState(null);
 
   // Эффект: загрузка входящих заявок
   useEffect(() => {
@@ -799,39 +800,55 @@ export default function Home() {
 
   // --- ХЭНДЛЕРЫ CMS И ПОРТФОЛИО ---
   const handleSaveSettings = async () => {
-    const handleFromUrl = (u) => {
-      if (!u) return '';
-      const clean = u.replace(/\/$/, '');
-      if (clean.startsWith('mailto:')) return clean.replace('mailto:', '');
-      if (clean.includes('wa.me/')) return '+' + clean.split('wa.me/')[1];
-      return '@' + clean.split('/').filter(Boolean).pop();
-    };
-    const contacts = { ...(publicSettings?.contacts || {}) };
-    if (editTg) contacts.telegram = { handle: handleFromUrl(editTg), url: editTg, sub: 'отвечаю быстрее всего' };
-    else delete contacts.telegram;
-    if (editWa) contacts.whatsapp = { handle: handleFromUrl(editWa), url: editWa, sub: 'звонки и сообщения' };
-    else delete contacts.whatsapp;
-    if (editIg) contacts.instagram = { handle: handleFromUrl(editIg), url: editIg, sub: 'свежие работы' };
-    else delete contacts.instagram;
-    if (editEmail) contacts.email = { handle: editEmail, url: `mailto:${editEmail}`, sub: 'для брифов и договоров' };
-    else delete contacts.email;
-
-    const newSettings = {
-      ...publicSettings,
-      tagline: editTagline,
-      aboutNote: editAboutNote,
-      about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
-      contacts,
-      facts: publicSettings?.facts || [
-        { label: 'Опыт', value: '06', note: 'лет в постобработке' },
-        { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
-        { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
-      ],
-    };
-    await setDoc(doc(db, 'site_settings', 'public'), newSettings, { merge: true });
-    setPublicSettings(newSettings);
-    alert('Тексты и контакты обновлены');
+  const handleFromUrl = (u) => {
+    if (!u) return '';
+    const clean = u.replace(/\/$/, '');
+    if (clean.startsWith('mailto:')) return clean.replace('mailto:', '');
+    if (clean.includes('wa.me/')) return '+' + clean.split('wa.me/')[1];
+    return '@' + clean.split('/').filter(Boolean).pop();
   };
+  
+  const contacts = { ...(publicSettings?.contacts || {}) };
+  if (editTg) contacts.telegram = { handle: handleFromUrl(editTg), url: editTg, sub: 'отвечаю быстрее всего' };
+  else delete contacts.telegram;
+  if (editWa) contacts.whatsapp = { handle: handleFromUrl(editWa), url: editWa, sub: 'звонки и сообщения' };
+  else delete contacts.whatsapp;
+  if (editIg) contacts.instagram = { handle: handleFromUrl(editIg), url: editIg, sub: 'свежие работы' };
+  else delete contacts.instagram;
+  if (editEmail) contacts.email = { handle: editEmail, url: `mailto:${editEmail}`, sub: 'для брифов и договоров' };
+  else delete contacts.email;
+
+  // --- НОВЫЙ БЛОК ДЛЯ ФОТО ---
+  let finalAboutUrl = publicSettings?.aboutUrl || '';
+  if (aboutFile) {
+    try {
+      finalAboutUrl = await uploadToImgBB(aboutFile);
+    } catch (e) {
+      return alert('Ошибка загрузки фото: ' + e.message);
+    }
+  }
+
+  // ----------------------------
+
+  const newSettings = {
+    ...publicSettings,
+    tagline: editTagline,
+    aboutNote: editAboutNote,
+    about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
+    contacts,
+    aboutUrl: finalAboutUrl, // Сохраняем ссылку в базу!
+    facts: publicSettings?.facts || [
+      { label: 'Опыт', value: '06', note: 'лет в постобработке' },
+      { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
+      { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
+    ],
+  };
+  
+  await setDoc(doc(db, 'site_settings', 'public'), newSettings, { merge: true });
+  setPublicSettings(newSettings);
+  setAboutFile(null); // Сбрасываем выбранный файл после успеха
+  alert('Тексты и контакты обновлены');
+};
 
   // Съёмка: сжимаем кадры и кладём в Firebase Storage, в Firestore — только ссылки.
   // (Base64 в документ не влезает: лимит документа 1 МБ, 5 фото его пробивают.)
@@ -870,34 +887,46 @@ export default function Home() {
     }
   };
 
+
+  const uploadToImgBB = async (file) => {
+  const formData = new FormData();
+  formData.append('image', file);
+  
+  const apiKey = process.env.NEXT_PUBLIC_IMGBB_KEY; 
+  const res = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
+    method: 'POST',
+    body: formData
+  });
+  
+  const data = await res.json();
+  if (!data.success) throw new Error(data.error?.message || 'Не удалось загрузить фото');
+  
+  return data.data.url; 
+};
+
+
   const handleCreateBA = async () => {
-    if (!baTitle || !baBefore || !baAfter) return alert('Заполни название и прикрепи оба кадра');
-    setIsUploadingBA(true);
-    try {
-      const stamp = Date.now();
-      const before = await compressImage(baBefore, 1600, 0.82);
-      const refB = ref(storage, `before_after/${stamp}_before.jpg`);
-      await uploadBytes(refB, before.blob, { contentType: 'image/jpeg' });
-      const beforeUrl = await getDownloadURL(refB);
+  if (!baTitle || !baBefore || !baAfter) return alert('Заполни название и прикрепи оба кадра');
+  setIsUploadingBA(true);
+  try {
+    // 1. Отправляем оригиналы напрямую в ImgBB
+    const beforeUrl = await uploadToImgBB(baBefore);
+    const afterUrl = await uploadToImgBB(baAfter);
 
-      const after = await compressImage(baAfter, 1600, 0.82);
-      const refA = ref(storage, `before_after/${stamp}_after.jpg`);
-      await uploadBytes(refA, after.blob, { contentType: 'image/jpeg' });
-      const afterUrl = await getDownloadURL(refA);
-
-      const newBA = { title: baTitle, note: baNote, beforeUrl, afterUrl, order: Date.now() };
-      const docRef = await addDoc(collection(db, 'before_after'), newBA);
-      
-      setPublicBeforeAfter(prev => [...prev, { id: docRef.id, ...newBA }]);
-      setShowAddBA(false);
-      setBaTitle(''); setBaNote(''); setBaBefore(null); setBaAfter(null);
-      alert('Ползунок до/после добавлен на сайт');
-    } catch (e) {
-      alert('Ошибка: ' + e.message);
-    } finally {
-      setIsUploadingBA(false);
-    }
-  };
+    // 2. Записываем только легкие текстовые ссылки в Firestore (лимита в 1МБ больше нет!)
+    const newBA = { title: baTitle, note: baNote, beforeUrl, afterUrl, order: Date.now() };
+    const docRef = await addDoc(collection(db, 'before_after'), newBA);
+    
+    setPublicBeforeAfter(prev => [...prev, { id: docRef.id, ...newBA }]);
+    setShowAddBA(false);
+    setBaTitle(''); setBaNote(''); setBaBefore(null); setBaAfter(null);
+    alert('Ползунок до/после добавлен на сайт');
+  } catch (e) {
+    alert('Ошибка: ' + e.message);
+  } finally {
+    setIsUploadingBA(false);
+  }
+};
 
 
   // --- ХЭНДЛЕРЫ РАБОТЫ С БАЗОЙ ---
@@ -1335,9 +1364,20 @@ export default function Home() {
               )}
 
               {cmsTab === 'settings' && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '40px' }}>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                    <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Главный экран</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '40px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Главный экран</h3>
+                  
+                  {/* --- НОВОЕ ПОЛЕ ЗАГРУЗКИ ФОТО --- */}
+                  <div style={{ border: '1px dashed var(--ink)', padding: '16px', background: 'var(--paper-2)' }}>
+                    <span style={{ fontSize: '12px', fontWeight: 'bold', display: 'block', marginBottom: '8px' }}>ФОТО ДЛЯ "ОБО МНЕ"</span>
+                    {publicSettings?.aboutUrl && !aboutFile && (
+                        <img src={publicSettings.aboutUrl} alt="Текущее фото" style={{ height: '80px', objectFit: 'cover', marginBottom: '12px', borderRadius: '4px' }} />
+                    )}
+                    <input type="file" accept="image/*" onChange={(e) => setAboutFile(e.target.files?.[0] || null)} style={{ fontSize: '11px', width: '100%', border: 'none', padding: 0 }} />
+                  </div>
+                  {/* -------------------------------- */}
+                    
                     <textarea value={editTagline} onChange={e => setEditTagline(e.target.value)} placeholder="Слоган (Tagline)" rows={3} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <textarea value={editAboutNote} onChange={e => setEditAboutNote(e.target.value)} placeholder="Короткая подпись к разделу «Обо мне»" rows={2} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <textarea value={editAbout} onChange={e => setEditAbout(e.target.value)} placeholder="Обо мне: каждый абзац с новой строки" rows={8} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
@@ -1429,15 +1469,18 @@ export default function Home() {
               </div>
               
               <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginBottom: '32px', maxWidth: '600px' }}>
-                <div style={{ display: 'flex', gap: '16px' }}>
-                  <select value={selectedStyle} onChange={(e) => setSelectedStyle(e.target.value)} style={{ flex: 1, padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none', cursor: 'pointer' }}>
-                    <option value="Beauty">Стиль: Beauty (макро, кожа, макияж)</option>
-                    <option value="Fashion">Стиль: Fashion (лукбуки, журналы)</option>
-                    <option value="Natural">Стиль: Natural (естественность, без пластики)</option>
-                  </select>
+               {/* Добавили flexWrap: 'wrap' чтобы на узких экранах элементы вставали друг под друга */}
+<div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px' }}>
+  
+  <select value={selectedStyle} onChange={(e) => setSelectedStyle(e.target.value)} style={{ flex: '1 1 250px', padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none', cursor: 'pointer' }}>
+    <option value="Beauty">Стиль: Beauty (макро, кожа, макияж)</option>
+    <option value="Fashion">Стиль: Fashion (лукбуки, журналы)</option>
+    <option value="Natural">Стиль: Natural (естественность, без пластики)</option>
+  </select>
 
-                  <input type="text" value={referenceProfile} onChange={(e) => setReferenceProfile(e.target.value)} placeholder="Профиль(и)-пример через запятую (monicalis_, anotherpro)" style={{ flex: 1, padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none' }} />
-                </div>
+  <input type="text" value={referenceProfile} onChange={(e) => setReferenceProfile(e.target.value)} placeholder="Профиль(и)-пример через запятую" style={{ flex: '1 1 250px', padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none' }} />
+  
+</div>
 
                 <div>
                   <div onPaste={handleReferencePhotoPaste} onDrop={handleReferencePhotoDrop} onDragOver={(e) => e.preventDefault()} tabIndex={0} style={{ border: '1px dashed var(--line-soft)', padding: '16px', fontSize: '13px', color: 'var(--mute)', outline: 'none', display: 'flex', flexDirection: 'column', gap: '10px' }}>
