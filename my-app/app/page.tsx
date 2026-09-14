@@ -451,16 +451,13 @@ function PublicSite({ onAdminClick }) {
         <div className="hero-l">
           <div className="hero-over">post-production</div>
           <h1 className="display hero-main">adriana</h1>
-          <div className="hero-meta">
-            <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
-            <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
-          </div>
+          
           <div className="hero-cta">
             <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
             <a href="#work" className="btn ghost">Смотреть работы</a>
           </div>
-          <p className="hero-hint">Первый кадр обрабатываю бесплатно — чтобы ты увидела подход до заказа.</p>
         </div>
+        
         <figure className="hero-img">
           {heroPhoto
             ? <img src={heroPhoto} alt="Бьюти-портрет после ретуши" />
@@ -476,7 +473,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">01 — about</div>
             <h2 className="display sec-title">обо мне</h2>
           </div>
-          <p className="sec-note">{settings?.aboutNote || 'Шесть лет в цвете и ретуши. Половина работ — коммерческие съёмки, половина — авторские проекты фотографов.'}</p>
         </div>
         <div className="about">
           {aboutPhoto ? <img src={aboutPhoto} alt="Адриана, ретушёр" /> : <div className="about-empty" />}
@@ -507,7 +503,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">02 — portfolio</div>
             <h2 className="display sec-title">портфолио</h2>
           </div>
-          <p className="sec-note">Выбери категорию — внутри работы собраны по съёмкам, так же как они приходят из студии.</p>
         </div>
 
         <div className="cats" role="tablist">
@@ -609,8 +604,8 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">05 — test</div>
             <h2 className="display sec-title">фото на тест</h2>
           </div>
-          <p className="sec-note">Один кадр — бесплатно. Напиши пару слов, приложи фото, и заявка придёт мне в Telegram.</p>
         </div>
+
         <div className="testgrid">
           <div className="steps">
             {[
@@ -1931,6 +1926,38 @@ textarea{resize:vertical;min-height:88px;line-height:1.55}
 .note{font-size:12px;color:var(--mute);line-height:1.55}
 .ok{border:1px solid var(--ink);padding:22px;font-size:14px;line-height:1.6}
 
+
+/* ── СТИЛИ ДЛЯ БЕЛОЙ ФОРМЫ НА ЧЕРНОМ ФОНЕ ── */
+.testform .form {
+  /* Жестко возвращаем светлые цвета внутри черной секции */
+  --ink: #0B0B0A;
+  --paper: #F4F2EF;
+  --paper-2: #EAE7E2;
+  --line: #D6D2CB;
+  --mute: #7C776E;
+  --accent: #A79E90;
+  
+  background: var(--paper);
+  padding: 40px;
+  border-radius: 8px;
+}
+.testform .form .field > span { color: var(--mute); }
+.testform .form input, .testform .form select, .testform .form textarea { color: var(--ink); border-bottom-color: var(--line); }
+.testform .form input::placeholder, .testform .form textarea::placeholder { color: var(--accent); }
+.testform .form .drop { border-color: var(--line); color: var(--mute); }
+.testform .form .drop.hot { background: var(--paper-2); border-color: var(--ink); }
+.testform .form .pick { color: var(--ink); border-color: var(--ink); }
+.testform .form .btn { background: var(--ink); color: var(--paper); }
+.testform .form .note { color: var(--mute); }
+
+/* Спускаем текст слева (шаги) немного вниз на компьютерах */
+@media (min-width: 861px) {
+  .steps {
+    margin-top: 40px;
+  }
+}
+
+
 /* ── подвал ── */
 footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 @media (min-width:900px){footer,.site-footer{padding:26px 56px 40px}}
@@ -1976,8 +2003,9 @@ footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:
   .hero-cta .btn{flex:1 1 100%;justify-content:center}
   .sec{padding:52px 20px 58px}
   .sec-head{padding-bottom:26px}
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
+  /* НОВОЕ: Журнальная сетка на мобилках */
+  .mrow { gap: 10px; }
+  .cell { min-height: 120px; }
   .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
   .site-footer{padding-bottom:96px}
   .mob-cta{display:flex;position:fixed;left:14px;right:14px;bottom:14px;z-index:88;align-items:center;justify-content:center;gap:10px;padding:16px;background:#0B0B0A;color:#F4F2EF;text-decoration:none;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;box-shadow:0 10px 30px rgba(11,11,10,.25);transform:translateY(140%);transition:transform .35s cubic-bezier(.2,.7,.2,1)}
@@ -2088,8 +2116,23 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
-.cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0; margin:0;}
-.cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
+.cell {
+  position: relative;
+  overflow: hidden;
+  cursor: zoom-in;
+  background: transparent; /* Убрали серый фон, чтобы фото парили */
+  min-width: 0;
+  margin: 0;
+}
+.cell img {
+  width: 100%;
+  height: 100%;
+  /* contain — втягивает фото целиком, сохраняя все пропорции */
+  object-fit: contain; 
+  object-position: center;
+  transition: transform .8s cubic-bezier(.2,.7,.2,1), filter .4s;
+}
+
 .cell:hover img{transform:scale(1.03)}
 .cell::after{content:attr(data-n);position:absolute;left:10px;bottom:8px;font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.2em;color:#fff;opacity:0;transition:opacity .3s;text-shadow:0 1px 6px rgba(0,0,0,.5)}
 .cell:hover::after{opacity:1}
