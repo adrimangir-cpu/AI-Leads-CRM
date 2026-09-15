@@ -2400,5 +2400,4 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
   .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
   .hero-main { font-size: 14vw !important; }
 }
-  
 `;
