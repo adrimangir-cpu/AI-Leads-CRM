@@ -1,9 +1,24 @@
 "use client";
 
+/* ============================================================
+   ADRIANA RETOUCH — один файл на два состояния:
+   • не авторизован → публичное портфолио (обо мне, категории,
+     каталоги съёмок, до/после, контакты, форма → Telegram)
+   • авторизован    → закрытая CRM и панель управления сайтом
+
+   Firestore:
+     portfolio_shoots     { category, title, year, order, cover, photos:[{url,w,h,path}] }
+     before_after         { title, note, beforeUrl, afterUrl, order }
+     site_settings/public { tagline, aboutNote, about[], facts[], heroUrl, aboutUrl, contacts{} }
+     leads_portfolio      { name, contact, task, message, photosCount, status, createdAt }
+
+   Фото съёмок и до/после лежат в Firebase Storage, в Firestore — только ссылки.
+   ============================================================ */
+
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
 import { db, auth, storage } from '../firebase';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
@@ -78,31 +93,145 @@ function buildRows(photos) {
 
 const plural = (n) => (n === 1 ? 'кадр' : n > 1 && n < 5 ? 'кадра' : 'кадров');
 
-/* сжатие в JPEG перед загрузкой в Storage */
-function compressImage(file, maxSide = 1600, quality = 0.82) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('не удалось прочитать файл'));
-    reader.onload = () => {
+/* Подготовка кадра перед загрузкой: уменьшаем и пересохраняем в JPEG.
+   Порядок важен для iPhone: сначала createImageBitmap (умеет HEIC и EXIF-поворот),
+   затем обычный <img> через blob-ссылку. Data-URL больше не используем — на iOS
+   он падал на тяжёлых кадрах с «The string did not match the expected pattern». */
+async function loadBitmap(file) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(file, { imageOrientation: 'from-image' });
+    } catch (e1) {
+      try { return await createImageBitmap(file); } catch (e2) { /* пробуем через <img> */ }
+    }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    return await new Promise((resolve, reject) => {
       const img = new window.Image();
-      img.onerror = () => reject(new Error('не удалось открыть изображение'));
-      img.onload = () => {
-        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-        const w = Math.round(img.width * scale);
-        const h = Math.round(img.height * scale);
-        const canvas = document.createElement('canvas');
-        canvas.width = w; canvas.height = h;
-        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-        canvas.toBlob(
-          (blob) => (blob ? resolve({ blob, w, h }) : reject(new Error('не удалось сжать кадр'))),
-          'image/jpeg',
-          quality
-        );
-      };
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('браузер не смог открыть этот файл'));
+      img.src = url;
+    });
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+}
+
+/* Загрузка в Storage.
+   Сначала пробуем возобновляемый режим — он даёт процент. Если за 8 секунд
+   не ушло ни одного байта (частая причина: в CORS хранилища не разрешены
+   служебные заголовки x-goog-upload-*), молча переключаемся на простую
+   загрузку одним куском со своим таймаутом. Так процент есть там, где он
+   возможен, а загрузка не зависает там, где нет. */
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+  ]);
+}
+
+function tryResumable(fileRef, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    let task;
+    try {
+      task = uploadBytesResumable(fileRef, blob, { contentType: 'image/jpeg' });
+    } catch (e) { reject(new Error('RESUMABLE_UNAVAILABLE')); return; }
+    let moved = false;
+    let last = Date.now();
+    const stop = setInterval(() => {
+      const idle = Date.now() - last;
+      if (!moved && idle > 8000) {
+        clearInterval(stop);
+        try { task.cancel(); } catch (e) { /* уже завершилась */ }
+        reject(new Error('RESUMABLE_STALLED'));
+      } else if (moved && idle > 45000) {
+        clearInterval(stop);
+        try { task.cancel(); } catch (e) { /* уже завершилась */ }
+        reject(new Error('связь пропала на середине загрузки — попробуй ещё раз, лучше по Wi-Fi'));
+      }
+    }, 2000);
+    task.on('state_changed',
+      (snap) => {
+        last = Date.now();
+        if (snap.bytesTransferred > 0) moved = true;
+        if (onProgress && snap.totalBytes) onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
+      },
+      (err) => {
+        clearInterval(stop);
+        const code = err && err.code ? String(err.code) : '';
+        if (!moved && /retry-limit|unknown|canceled/.test(code)) reject(new Error('RESUMABLE_STALLED'));
+        else if (/unauthorized|unauthenticated/.test(code)) reject(new Error('хранилище не разрешает запись (правила Storage) — ' + code));
+        else reject(new Error(code || err.message || 'хранилище не приняло файл'));
+      },
+      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve('resumable'); }
+    );
   });
+}
+
+async function uploadWithProgress(fileRef, blob, onProgress) {
+  try {
+    return await tryResumable(fileRef, blob, onProgress);
+  } catch (e) {
+    const m = e && e.message ? e.message : '';
+    if (m !== 'RESUMABLE_STALLED' && m !== 'RESUMABLE_UNAVAILABLE') throw e;
+  }
+  // запасной путь: простая загрузка, без процента, но со своим таймаутом
+  if (onProgress) onProgress(-1);
+  await withTimeout(
+    uploadBytes(fileRef, blob, { contentType: 'image/jpeg' }),
+    150000,
+    'файл не загрузился за 2,5 минуты — проверь связь и попробуй по Wi-Fi'
+  );
+  if (onProgress) onProgress(100);
+  return 'simple';
+}
+
+async function compressImage(file, maxSide = 1600, quality = 0.82) {
+  if (!file) throw new Error('файл не выбран');
+  const name = file.name || '';
+  const isHeic = /heic|heif/i.test(file.type || '') || /\.(heic|heif)$/i.test(name);
+  if (!/^image\//.test(file.type || '') && !/\.(jpe?g|png|webp|heic|heif|avif)$/i.test(name)) {
+    throw new Error('это не изображение');
+  }
+  if (file.size > 60 * 1024 * 1024) throw new Error('файл тяжелее 60 МБ, уменьши его');
+
+  let src;
+  try {
+    src = await loadBitmap(file);
+  } catch (e) {
+    throw new Error(isHeic
+      ? 'кадр в формате HEIC не открылся. На iPhone: Настройки → Камера → Форматы → «Наиболее совместимый», либо пересохрани кадр в JPEG'
+      : 'не удалось открыть изображение (' + (e.message || 'неизвестный формат') + ')');
+  }
+
+  const iw = src.width, ih = src.height;
+  if (!iw || !ih) throw new Error('у файла нулевой размер');
+  const scale = Math.min(1, maxSide / Math.max(iw, ih));
+  const w = Math.max(1, Math.round(iw * scale));
+  const h = Math.max(1, Math.round(ih * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('браузер не дал холст для сжатия');
+  ctx.drawImage(src, 0, 0, w, h);
+  if (typeof src.close === 'function') src.close();
+
+  let blob = null;
+  if (canvas.toBlob) {
+    blob = await new Promise((resolve) => { try { canvas.toBlob(resolve, 'image/jpeg', quality); } catch (e) { resolve(null); } });
+  }
+  if (!blob) {
+    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+    const bin = atob((dataUrl.split(',')[1] || ''));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    blob = new Blob([bytes], { type: 'image/jpeg' });
+  }
+  if (!blob || !blob.size) throw new Error('не получилось пересохранить кадр в JPEG');
+  return { blob, w, h };
 }
 
 const fileToDataUri = (file) => new Promise((resolve, reject) => {
@@ -308,6 +437,7 @@ function PublicSite({ onAdminClick }) {
   const [loading, setLoading] = useState(true);
   const [scrolled, setScrolled] = useState(false); // ушли ниже первого экрана
   const [menu, setMenu] = useState(false);         // открыто боковое меню
+  const [atForm, setAtForm] = useState(false);     // форма отправки на экране
 
   useEffect(() => {
     (async () => {
@@ -360,14 +490,20 @@ function PublicSite({ onAdminClick }) {
     }
   }, [loading, shoots]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const visible = shoots.filter((s) => s.category === cat);
+  const withCoverFirst = (s) => {
+    const ph = [...(s.photos || [])];
+    const i = ph.findIndex((p) => p.url === s.cover);
+    if (i > 0) ph.unshift(ph.splice(i, 1)[0]);
+    return ph;
+  };
+  const visible = shoots.filter((s) => s.category === cat).map((s) => ({ ...s, photos: withCoverFirst(s) }));
   const contacts = { ...FALLBACK_CONTACTS, ...(settings?.contacts || {}) };
   const facts = settings?.facts || [
     { label: 'Опыт', value: '06', note: 'лет в постобработке' },
     { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
     { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
   ];
-  const heroPhoto = settings?.heroUrl || shoots[0]?.photos?.[0]?.url || '';
+  const heroPhoto = settings?.heroUrl || '';
   const aboutPhoto = settings?.aboutUrl || '';
   const year = new Date().getFullYear();
 
@@ -378,6 +514,15 @@ function PublicSite({ onAdminClick }) {
     ['#contact', 'Контакты'],
     ['#form', 'Тест-ретушь'],
   ];
+
+  useEffect(() => {
+    if (typeof IntersectionObserver === 'undefined') return;
+    const el = document.getElementById('form');
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setAtForm(e.isIntersecting), { threshold: 0.08 });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [loading]);
 
   const openLb = (shoot, idx) => setLb({
     list: shoot.photos.map((p, i) => ({ url: p.url, cap: `${shoot.title} — ${i + 1} / ${shoot.photos.length}` })),
@@ -443,7 +588,7 @@ function PublicSite({ onAdminClick }) {
         </nav>
         <div className="drawer-foot">
           <a href="#form" className="btn" onClick={() => setMenu(false)}>Фото на тест <span>→</span></a>
-          <button className="drawer-admin" onClick={() => { setMenu(false); onAdminClick(); }}>Admin</button>
+          <button className="drawer-admin" onClick={() => { setMenu(false); onAdminClick(); }}>Вход для владельца</button>
         </div>
       </aside>
 
@@ -451,17 +596,20 @@ function PublicSite({ onAdminClick }) {
         <div className="hero-l">
           <div className="hero-over">post-production</div>
           <h1 className="display hero-main">adriana</h1>
-          
+          <div className="hero-meta">
+            <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
+            <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
+          </div>
           <div className="hero-cta">
             <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
             <a href="#work" className="btn ghost">Смотреть работы</a>
           </div>
+          <p className="hero-hint">Первый кадр обрабатываю бесплатно — чтобы ты увидела подход до заказа.</p>
         </div>
-        
         <figure className="hero-img">
           {heroPhoto
             ? <img src={heroPhoto} alt="Бьюти-портрет после ретуши" />
-            : <div className="hero-empty"><span className="label">Загрузи первую съёмку в дашборде</span></div>}
+            : <div className="hero-empty"><span className="label">Титульное фото задаётся в дашборде · Портфолио · Настройки сайта</span></div>}
           <figcaption><span className="label">Beauty · {year}</span><span className="label">— 001</span></figcaption>
         </figure>
       </section>
@@ -473,6 +621,7 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">01 — about</div>
             <h2 className="display sec-title">обо мне</h2>
           </div>
+          <p className="sec-note">{settings?.aboutNote || 'Шесть лет в цвете и ретуши. Половина работ — коммерческие съёмки, половина — авторские проекты фотографов.'}</p>
         </div>
         <div className="about">
           {aboutPhoto ? <img src={aboutPhoto} alt="Адриана, ретушёр" /> : <div className="about-empty" />}
@@ -503,6 +652,7 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">02 — portfolio</div>
             <h2 className="display sec-title">портфолио</h2>
           </div>
+          <p className="sec-note">Выбери категорию — внутри работы собраны по съёмкам, так же как они приходят из студии.</p>
         </div>
 
         <div className="cats" role="tablist">
@@ -604,8 +754,8 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">05 — test</div>
             <h2 className="display sec-title">фото на тест</h2>
           </div>
+          <p className="sec-note">Один кадр — бесплатно. Напиши пару слов, приложи фото, и заявка придёт мне в Telegram.</p>
         </div>
-
         <div className="testgrid">
           <div className="steps">
             {[
@@ -632,7 +782,7 @@ function PublicSite({ onAdminClick }) {
       </footer>
 
       {/* мобильная кнопка внизу: тест-ретушь всегда в одном касании */}
-      <a href="#form" className={`mob-cta ${scrolled ? 'on' : ''}`}>Фото на тест — бесплатно <span>→</span></a>
+      <a href="#form" className={`mob-cta ${scrolled && !atForm && !menu ? 'on' : ''}`}>Фото на тест — бесплатно <span>→</span></a>
 
       <Lightbox
         list={lb.list}
@@ -713,7 +863,15 @@ export default function Home() {
   const [baBefore, setBaBefore] = useState(null);
   const [baAfter, setBaAfter] = useState(null);
   const [isUploadingBA, setIsUploadingBA] = useState(false);
-  const [aboutFile, setAboutFile] = useState(null);
+  const [baStep, setBaStep] = useState('');
+  const [baError, setBaError] = useState('');
+  const [shootError, setShootError] = useState('');
+  const [siteImgBusy, setSiteImgBusy] = useState('');
+  const [siteImgError, setSiteImgError] = useState('');
+  const [settingsSaved, setSettingsSaved] = useState(false);
+  const [upPct, setUpPct] = useState(0);
+  const [shootBusyId, setShootBusyId] = useState('');
+  const [openShootId, setOpenShootId] = useState('');
 
   // Эффект: загрузка входящих заявок
   useEffect(() => {
@@ -795,60 +953,46 @@ export default function Home() {
 
   // --- ХЭНДЛЕРЫ CMS И ПОРТФОЛИО ---
   const handleSaveSettings = async () => {
-  const handleFromUrl = (u) => {
-    if (!u) return '';
-    const clean = u.replace(/\/$/, '');
-    if (clean.startsWith('mailto:')) return clean.replace('mailto:', '');
-    if (clean.includes('wa.me/')) return '+' + clean.split('wa.me/')[1];
-    return '@' + clean.split('/').filter(Boolean).pop();
+    const handleFromUrl = (u) => {
+      if (!u) return '';
+      const clean = u.replace(/\/$/, '');
+      if (clean.startsWith('mailto:')) return clean.replace('mailto:', '');
+      if (clean.includes('wa.me/')) return '+' + clean.split('wa.me/')[1];
+      return '@' + clean.split('/').filter(Boolean).pop();
+    };
+    const contacts = { ...(publicSettings?.contacts || {}) };
+    if (editTg) contacts.telegram = { handle: handleFromUrl(editTg), url: editTg, sub: 'отвечаю быстрее всего' };
+    else delete contacts.telegram;
+    if (editWa) contacts.whatsapp = { handle: handleFromUrl(editWa), url: editWa, sub: 'звонки и сообщения' };
+    else delete contacts.whatsapp;
+    if (editIg) contacts.instagram = { handle: handleFromUrl(editIg), url: editIg, sub: 'свежие работы' };
+    else delete contacts.instagram;
+    if (editEmail) contacts.email = { handle: editEmail, url: `mailto:${editEmail}`, sub: 'для брифов и договоров' };
+    else delete contacts.email;
+
+    const newSettings = {
+      ...publicSettings,
+      tagline: editTagline,
+      aboutNote: editAboutNote,
+      about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
+      contacts,
+      facts: publicSettings?.facts || [
+        { label: 'Опыт', value: '06', note: 'лет в постобработке' },
+        { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
+        { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
+      ],
+    };
+    await setDoc(doc(db, 'site_settings', 'public'), newSettings, { merge: true });
+    setPublicSettings(newSettings);
+    setSettingsSaved(true);
+    setTimeout(() => setSettingsSaved(false), 2600);
   };
-  
-  const contacts = { ...(publicSettings?.contacts || {}) };
-  if (editTg) contacts.telegram = { handle: handleFromUrl(editTg), url: editTg, sub: 'отвечаю быстрее всего' };
-  else delete contacts.telegram;
-  if (editWa) contacts.whatsapp = { handle: handleFromUrl(editWa), url: editWa, sub: 'звонки и сообщения' };
-  else delete contacts.whatsapp;
-  if (editIg) contacts.instagram = { handle: handleFromUrl(editIg), url: editIg, sub: 'свежие работы' };
-  else delete contacts.instagram;
-  if (editEmail) contacts.email = { handle: editEmail, url: `mailto:${editEmail}`, sub: 'для брифов и договоров' };
-  else delete contacts.email;
-
-  // --- НОВЫЙ БЛОК ДЛЯ ФОТО ---
-  let finalAboutUrl = publicSettings?.aboutUrl || '';
-  if (aboutFile) {
-    try {
-      finalAboutUrl = await uploadToImgBB(aboutFile);
-    } catch (e) {
-      return alert('Ошибка загрузки фото: ' + e.message);
-    }
-  }
-
-  // ----------------------------
-
-  const newSettings = {
-    ...publicSettings,
-    tagline: editTagline,
-    aboutNote: editAboutNote,
-    about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
-    contacts,
-    aboutUrl: finalAboutUrl, // Сохраняем ссылку в базу!
-    facts: publicSettings?.facts || [
-      { label: 'Опыт', value: '06', note: 'лет в постобработке' },
-      { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
-      { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
-    ],
-  };
-  
-  await setDoc(doc(db, 'site_settings', 'public'), newSettings, { merge: true });
-  setPublicSettings(newSettings);
-  setAboutFile(null); // Сбрасываем выбранный файл после успеха
-  alert('Тексты и контакты обновлены');
-};
 
   // Съёмка: сжимаем кадры и кладём в Firebase Storage, в Firestore — только ссылки.
   // (Base64 в документ не влезает: лимит документа 1 МБ, 5 фото его пробивают.)
   const handleCreateShoot = async () => {
-    if (!shootTitle.trim() || shootFiles.length === 0) return alert('Укажи название и выбери фото');
+    if (!shootTitle.trim() || shootFiles.length === 0) { setShootError('Укажи название и выбери фото'); return; }
+    setShootError('');
     setIsUploading(true);
     try {
       const stamp = Date.now();
@@ -858,7 +1002,8 @@ export default function Home() {
         const { blob, w, h: hh } = await compressImage(shootFiles[i], 1600, 0.82);
         const path = `portfolio/${stamp}_${String(i + 1).padStart(2, '0')}.jpg`;
         const fileRef = ref(storage, path);
-        await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+        setUpPct(0);
+        await uploadWithProgress(fileRef, blob, setUpPct);
         photos.push({ url: await getDownloadURL(fileRef), w, h: hh, path });
       }
       const newShoot = {
@@ -873,56 +1018,129 @@ export default function Home() {
       setPublicShoots(prev => [...prev, { id: docRef.id, ...newShoot }]);
       setShowAddShoot(false);
       setShootTitle(''); setShootFiles([]); setShootYear('');
-      alert('Съёмка опубликована на сайте');
     } catch (error) {
-      alert('Ошибка загрузки: ' + error.message);
+      setShootError('Не загрузилось: ' + (error.message || error.code || 'неизвестная ошибка'));
     } finally {
       setIsUploading(false);
       setUploadStep('');
     }
   };
 
-
-  const uploadToImgBB = async (file) => {
-  const formData = new FormData();
-  formData.append('image', file);
-  
-  // Отправляем фото на наш безопасный Vercel-сервер (он обойдет блокировку)
-  const res = await fetch('/api/upload', {
-    method: 'POST',
-    body: formData
-  });
-  
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  
-  return data.url; 
-};
-
-
   const handleCreateBA = async () => {
-  if (!baTitle || !baBefore || !baAfter) return alert('Заполни название и прикрепи оба кадра');
-  setIsUploadingBA(true);
-  try {
-    // 1. Отправляем оригиналы напрямую в ImgBB
-    const beforeUrl = await uploadToImgBB(baBefore);
-    const afterUrl = await uploadToImgBB(baAfter);
+    if (!baTitle.trim() || !baBefore || !baAfter) { setBaError('Заполни заголовок и прикрепи оба кадра'); return; }
+    setBaError('');
+    setIsUploadingBA(true);
+    try {
+      const stamp = Date.now();
 
-    // 2. Записываем только легкие текстовые ссылки в Firestore (лимита в 1МБ больше нет!)
-    const newBA = { title: baTitle, note: baNote, beforeUrl, afterUrl, order: Date.now() };
-    const docRef = await addDoc(collection(db, 'before_after'), newBA);
-    
-    setPublicBeforeAfter(prev => [...prev, { id: docRef.id, ...newBA }]);
-    setShowAddBA(false);
-    setBaTitle(''); setBaNote(''); setBaBefore(null); setBaAfter(null);
-    alert('Ползунок до/после добавлен на сайт');
-  } catch (e) {
-    alert('Ошибка: ' + e.message);
-  } finally {
-    setIsUploadingBA(false);
-  }
-};
+      setBaStep('готовлю кадр «до»');
+      let before;
+      try { before = await compressImage(baBefore, 1600, 0.82); }
+      catch (e) { throw new Error('кадр «до»: ' + e.message); }
 
+      setBaStep('загружаю кадр «до»');
+      const refB = ref(storage, `before_after/${stamp}_before.jpg`);
+      setUpPct(0);
+      await uploadWithProgress(refB, before.blob, setUpPct);
+      const beforeUrl = await getDownloadURL(refB);
+
+      setBaStep('готовлю кадр «после»');
+      let after;
+      try { after = await compressImage(baAfter, 1600, 0.82); }
+      catch (e) { throw new Error('кадр «после»: ' + e.message); }
+
+      setBaStep('загружаю кадр «после»');
+      const refA = ref(storage, `before_after/${stamp}_after.jpg`);
+      setUpPct(0);
+      await uploadWithProgress(refA, after.blob, setUpPct);
+      const afterUrl = await getDownloadURL(refA);
+
+      setBaStep('сохраняю на сайт');
+      const newBA = { title: baTitle.trim(), note: baNote.trim(), beforeUrl, afterUrl, order: stamp };
+      const docRef = await addDoc(collection(db, 'before_after'), newBA);
+
+      setPublicBeforeAfter(prev => [...prev, { id: docRef.id, ...newBA }]);
+      setShowAddBA(false);
+      setBaTitle(''); setBaNote(''); setBaBefore(null); setBaAfter(null);
+    } catch (e) {
+      setBaError(e.message || e.code || 'неизвестная ошибка');
+    } finally {
+      setIsUploadingBA(false);
+      setBaStep('');
+      setUpPct(0);
+    }
+  };
+
+  // Титульное фото и портрет «обо мне» — управляются только отсюда
+  const handleUploadSiteImage = async (kind, file) => {
+    if (!file) return;
+    setSiteImgError('');
+    setSiteImgBusy(kind);
+    try {
+      setUpPct(0);
+      const { blob } = await compressImage(file, 1800, 0.84);
+      const fileRef = ref(storage, `portfolio/site_${kind}_${Date.now()}.jpg`);
+      await uploadWithProgress(fileRef, blob, setUpPct);
+      const url = await getDownloadURL(fileRef);
+      const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
+      await setDoc(doc(db, 'site_settings', 'public'), { [field]: url }, { merge: true });
+      setPublicSettings(prev => ({ ...(prev || {}), [field]: url }));
+    } catch (e) {
+      setSiteImgError((kind === 'hero' ? 'Титульное фото: ' : 'Портрет: ') + (e.message || e.code || 'ошибка'));
+    } finally {
+      setSiteImgBusy('');
+      setUpPct(0);
+    }
+  };
+
+  const handleClearSiteImage = async (kind) => {
+    const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
+    await setDoc(doc(db, 'site_settings', 'public'), { [field]: '' }, { merge: true });
+    setPublicSettings(prev => ({ ...(prev || {}), [field]: '' }));
+  };
+
+  // Кадры внутри съёмки: обложка, удаление, добавление
+  const handleSetCover = async (shoot, url) => {
+    await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { cover: url });
+    setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, cover: url } : x)));
+  };
+
+  const handleDeletePhoto = async (shoot, idx) => {
+    const photos = (shoot.photos || []).filter((_, i) => i !== idx);
+    const cover = photos.some(ph => ph.url === shoot.cover) ? shoot.cover : (photos[0]?.url || '');
+    await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { photos, cover });
+    setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, photos, cover } : x)));
+  };
+
+  const handleAddPhotosToShoot = async (shoot, files) => {
+    const list = Array.from(files || []);
+    if (!list.length) return;
+    setShootError('');
+    setShootBusyId(shoot.id);
+    try {
+      const stamp = Date.now();
+      const added = [];
+      for (let i = 0; i < list.length; i++) {
+        setUploadStep(`${i + 1} / ${list.length}`);
+        const { blob, w, h } = await compressImage(list[i], 1600, 0.82);
+        const path = `portfolio/${stamp}_add_${String(i + 1).padStart(2, '0')}.jpg`;
+        const fileRef = ref(storage, path);
+        setUpPct(0);
+        await uploadWithProgress(fileRef, blob, setUpPct);
+        added.push({ url: await getDownloadURL(fileRef), w, h, path });
+      }
+      const photos = [...(shoot.photos || []), ...added];
+      const cover = shoot.cover || photos[0]?.url || '';
+      await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { photos, cover });
+      setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, photos, cover } : x)));
+    } catch (e) {
+      setShootError('Не удалось добавить кадры: ' + (e.message || e.code || 'ошибка'));
+    } finally {
+      setShootBusyId('');
+      setUploadStep('');
+      setUpPct(0);
+    }
+  };
 
   // --- ХЭНДЛЕРЫ РАБОТЫ С БАЗОЙ ---
   const handleAddLead = async () => {
@@ -1186,7 +1404,7 @@ export default function Home() {
        <div className="header-meta">
           <span className="mono-label">03 Active projects</span>
           <span className="mono-label">sept 04 2026</span>
-          <button onClick={handleLogout} style={{background:'none', border:'none', cursor:'pointer', color:'var(--mute)', textDecoration:'underline'}}>Выйти</button>
+          <button onClick={handleLogout} className="logout">Выйти из аккаунта</button>
         </div>
       </header>
 
@@ -1312,12 +1530,12 @@ export default function Home() {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', gap: '12px', borderBottom: '1px solid var(--line-soft)', paddingBottom: '16px', marginBottom: '32px' }}>
+              <div className="cms-tabs">
                 {[
-                  { id: 'requests', label: 'Заявки с сайта 📥' },
-                  { id: 'settings', label: 'Обо мне и Контакты 📝' },
-                  { id: 'shoots', label: 'Галерея съёмок 📸' },
-                  { id: 'beforeAfter', label: 'До / После 🌗' }
+                  { id: 'requests', label: 'Заявки с сайта' },
+                  { id: 'settings', label: 'Тексты и фото сайта' },
+                  { id: 'shoots', label: 'Галерея съёмок' },
+                  { id: 'beforeAfter', label: 'До / после' }
                 ].map(tab => (
                   <button 
                     key={tab.id}
@@ -1359,24 +1577,39 @@ export default function Home() {
               )}
 
               {cmsTab === 'settings' && (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '40px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Главный экран</h3>
-                  
-                  {/* --- НОВОЕ ПОЛЕ ЗАГРУЗКИ ФОТО --- */}
-                  <div style={{ border: '1px dashed var(--ink)', padding: '16px', background: 'var(--paper-2)' }}>
-                    <span style={{ fontSize: '12px', fontWeight: 'bold', display: 'block', marginBottom: '8px' }}>ФОТО ДЛЯ "ОБО МНЕ"</span>
-                    {publicSettings?.aboutUrl && !aboutFile && (
-                        <img src={publicSettings.aboutUrl} alt="Текущее фото" style={{ height: '80px', objectFit: 'cover', marginBottom: '12px', borderRadius: '4px' }} />
-                    )}
-                    <input type="file" accept="image/*" onChange={(e) => setAboutFile(e.target.files?.[0] || null)} style={{ fontSize: '11px', width: '100%', border: 'none', padding: 0 }} />
-                  </div>
-                  {/* -------------------------------- */}
-                    
+                <div className="cms-2col">
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                    <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Главный экран</h3>
                     <textarea value={editTagline} onChange={e => setEditTagline(e.target.value)} placeholder="Слоган (Tagline)" rows={3} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <textarea value={editAboutNote} onChange={e => setEditAboutNote(e.target.value)} placeholder="Короткая подпись к разделу «Обо мне»" rows={2} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <textarea value={editAbout} onChange={e => setEditAbout(e.target.value)} placeholder="Обо мне: каждый абзац с новой строки" rows={8} style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
                     <button onClick={handleSaveSettings} className="badge solid" style={{ padding: '12px', cursor: 'pointer', border: 'none', width: 'fit-content' }}>Сохранить тексты и контакты</button>
+                    {settingsSaved && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>Сохранено, сайт обновлён</span>}
+
+                    <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Фото сайта</h3>
+                    <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
+                      Титульный кадр и портрет для раздела «Обо мне» ставятся только здесь. Сайт не берёт фото из съёмок автоматически.
+                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке видно, что идёт.
+                    </p>
+                    {siteImgError && <span style={{ fontSize: '12px', color: '#8A3B33' }}>{siteImgError}</span>}
+                    <div className="cms-2col tight">
+                      {[['hero', 'Титульный кадр', publicSettings?.heroUrl], ['about', 'Портрет «Обо мне»', publicSettings?.aboutUrl]].map(([kind, label, url]) => (
+                        <div key={kind} style={{ border: '1px solid var(--line-soft)', padding: '14px', background: 'var(--paper-2)', display: 'flex', flexDirection: 'column', gap: '10px', minWidth: 0 }}>
+                          <span className="mono-label">{label}</span>
+                          <div style={{ aspectRatio: '4 / 5', background: 'var(--paper)', border: '1px solid var(--line-soft)', overflow: 'hidden', display: 'grid', placeItems: 'center' }}>
+                            {url
+                              ? <img src={url} alt={label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                              : <span style={{ fontSize: '12px', color: 'var(--mute)', textAlign: 'center', padding: '10px' }}>пока не выбрано</span>}
+                          </div>
+                          <label className="badge solid" style={{ cursor: 'pointer', textAlign: 'center', padding: '10px 12px' }}>
+                            {siteImgBusy === kind ? (upPct > 0 ? `Загружаю ${upPct}%` : upPct < 0 ? 'Загружаю, это может занять минуту…' : 'Готовлю кадр…') : (url ? 'Заменить' : 'Выбрать фото')}
+                            <input type="file" accept="image/*" hidden disabled={siteImgBusy === kind}
+                              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; handleUploadSiteImage(kind, f); }} />
+                          </label>
+                          {url && <button onClick={() => handleClearSiteImage(kind)} style={{ background: 'none', border: 'none', color: 'var(--mute)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline' }}>Убрать</button>}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Контакты (Ссылки)</h3>
@@ -1392,20 +1625,52 @@ export default function Home() {
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Управление съёмками</h3>
-                    <button onClick={() => setShowAddShoot(true)} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить съёмку</button>
+                    <button onClick={() => { setShootError(''); setShowAddShoot(true); }} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить съёмку</button>
                   </div>
+                  {shootError && <p style={{ fontSize: '12px', color: '#8A3B33', margin: '0 0 14px' }}>{shootError}</p>}
                   <div style={{ display: 'grid', gap: '16px' }}>
                     {publicShoots.map(s => (
-                       <div key={s.id} style={{ padding: '16px', border: '1px solid var(--line-soft)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--paper-2)' }}>
-                         <div>
-                           <strong style={{ fontFamily: 'Archivo' }}>{s.title}</strong> <span style={{color: 'var(--mute)', fontSize: '13px'}}>({s.category}, {s.photos?.length || 0} фото)</span>
+                       <div key={s.id} style={{ padding: '16px', border: '1px solid var(--line-soft)', background: 'var(--paper-2)', minWidth: 0 }}>
+                         <div className="shoot-row">
+                           <div style={{ minWidth: 0 }}>
+                             <strong style={{ fontFamily: 'Archivo' }}>{s.title}</strong>{' '}
+                             <span style={{color: 'var(--mute)', fontSize: '13px'}}>({s.category}, {s.photos?.length || 0} фото)</span>
+                           </div>
+                           <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+                             <button onClick={() => setOpenShootId(openShootId === s.id ? '' : s.id)} style={{ background: 'none', border: 'none', color: 'var(--ink)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline' }}>
+                               {openShootId === s.id ? 'Свернуть кадры' : 'Кадры и обложка'}
+                             </button>
+                             <button onClick={async () => {
+                               if(confirm('Точно удалить съёмку?')) {
+                                 await deleteDoc(doc(db, 'portfolio_shoots', s.id));
+                                 setPublicShoots(prev => prev.filter(x => x.id !== s.id));
+                               }
+                             }} style={{ background: 'none', border: 'none', color: 'var(--mute)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline' }}>Удалить съёмку</button>
+                           </div>
                          </div>
-                         <button onClick={async () => {
-                           if(confirm('Точно удалить съемку?')) {
-                             await deleteDoc(doc(db, 'portfolio_shoots', s.id));
-                             setPublicShoots(prev => prev.filter(x => x.id !== s.id));
-                           }
-                         }} style={{ background: 'none', border: 'none', color: 'var(--mute)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline' }}>Удалить</button>
+
+                         {openShootId === s.id && (
+                           <div style={{ marginTop: '16px', borderTop: '1px solid var(--line-soft)', paddingTop: '16px' }}>
+                             <div className="ph-grid">
+                               {(s.photos || []).map((ph, i) => (
+                                 <div key={ph.url + i} className={`ph ${s.cover === ph.url ? 'is-cover' : ''}`}>
+                                   <img src={ph.url} alt={`${s.title} — кадр ${i + 1}`} />
+                                   <div className="ph-acts">
+                                     {s.cover === ph.url
+                                       ? <span className="ph-tag">обложка</span>
+                                       : <button onClick={() => handleSetCover(s, ph.url)}>обложка</button>}
+                                     <button onClick={() => { if (confirm('Убрать этот кадр с сайта?')) handleDeletePhoto(s, i); }}>удалить</button>
+                                   </div>
+                                 </div>
+                               ))}
+                             </div>
+                             <label className="badge" style={{ display: 'inline-block', marginTop: '14px', cursor: 'pointer', border: '1px solid var(--ink)' }}>
+                               {shootBusyId === s.id ? `Загружаю ${uploadStep}${upPct > 0 && upPct < 100 ? ` · ${upPct}%` : ''}` : '+ Добавить кадры'}
+                               <input type="file" accept="image/*" multiple hidden disabled={shootBusyId === s.id}
+                                 onChange={(e) => { const f = e.target.files; e.target.value = ''; handleAddPhotosToShoot(s, f); }} />
+                             </label>
+                           </div>
+                         )}
                        </div>
                     ))}
                   </div>
@@ -1416,7 +1681,7 @@ export default function Home() {
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Интерактивные ползунки</h3>
-                    <button onClick={() => setShowAddBA(true)} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить пару фото</button>
+                    <button onClick={() => { setBaError(''); setShowAddBA(true); }} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить пару фото</button>
                   </div>
                   <div style={{ display: 'grid', gap: '16px' }}>
                     {publicBeforeAfter.map(ba => (
@@ -1464,18 +1729,15 @@ export default function Home() {
               </div>
               
               <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginBottom: '32px', maxWidth: '600px' }}>
-               {/* Добавили flexWrap: 'wrap' чтобы на узких экранах элементы вставали друг под друга */}
-<div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px' }}>
-  
-  <select value={selectedStyle} onChange={(e) => setSelectedStyle(e.target.value)} style={{ flex: '1 1 250px', padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none', cursor: 'pointer' }}>
-    <option value="Beauty">Стиль: Beauty (макро, кожа, макияж)</option>
-    <option value="Fashion">Стиль: Fashion (лукбуки, журналы)</option>
-    <option value="Natural">Стиль: Natural (естественность, без пластики)</option>
-  </select>
+                <div className="cms-2col tight">
+                  <select value={selectedStyle} onChange={(e) => setSelectedStyle(e.target.value)} style={{ flex: 1, padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none', cursor: 'pointer' }}>
+                    <option value="Beauty">Стиль: Beauty (макро, кожа, макияж)</option>
+                    <option value="Fashion">Стиль: Fashion (лукбуки, журналы)</option>
+                    <option value="Natural">Стиль: Natural (естественность, без пластики)</option>
+                  </select>
 
-  <input type="text" value={referenceProfile} onChange={(e) => setReferenceProfile(e.target.value)} placeholder="Профиль(и)-пример через запятую" style={{ flex: '1 1 250px', padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none' }} />
-  
-</div>
+                  <input type="text" value={referenceProfile} onChange={(e) => setReferenceProfile(e.target.value)} placeholder="Профиль(и)-пример через запятую (monicalis_, anotherpro)" style={{ flex: 1, padding: '14px', border: '1px solid var(--line-soft)', background: 'transparent', fontFamily: 'inherit', fontSize: '14px', outline: 'none' }} />
+                </div>
 
                 <div>
                   <div onPaste={handleReferencePhotoPaste} onDrop={handleReferencePhotoDrop} onDragOver={(e) => e.preventDefault()} tabIndex={0} style={{ border: '1px dashed var(--line-soft)', padding: '16px', fontSize: '13px', color: 'var(--mute)', outline: 'none', display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -1576,7 +1838,7 @@ export default function Home() {
                 <div className="stat" style={{ padding: '16px 24px' }}><div className="mono-label">Конверсия</div><div className="stat-val" style={{ fontSize: '32px', margin: '8px 0' }}>14.5%</div></div>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '24px' }}>
+              <div className="cms-search">
                 <div style={{ borderRight: '1px solid var(--line-soft)', paddingRight: '24px' }}>
                   <h3 className="mono-label" style={{ marginBottom: '16px' }}>Выбор получателя</h3>
                   {displayLeads.map(lead => (
@@ -1608,7 +1870,7 @@ export default function Home() {
       {/* 1. Модалка "Новая съёмка" */}
       {showAddShoot && (
         <div onClick={() => !isUploading && setShowAddShoot(false)} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--paper)', width: '90%', maxWidth: '500px', padding: '32px', borderRadius: '4px', display: 'flex', flexDirection: 'column', gap: '16px', border: '1px solid var(--line-soft)' }}>
+          <div onClick={(e) => e.stopPropagation()} className="modal-card">
             <h2 style={{ margin: '0 0 8px', fontFamily: 'Archivo', fontSize: '24px' }}>Новая съёмка</h2>
             
             <input type="text" placeholder="Название (например: Украшения — золото)" value={shootTitle} onChange={e => setShootTitle(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
@@ -1628,9 +1890,10 @@ export default function Home() {
                <p style={{ fontSize: '12px', color: 'var(--mute)', marginTop: '12px' }}>Выбрано фото: {shootFiles.length}</p>
             </div>
 
+            {shootError && <span style={{ fontSize: '12px', color: '#8A3B33', lineHeight: 1.5 }}>{shootError}</span>}
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateShoot} disabled={isUploading} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploading ? 'wait' : 'pointer' }}>
-                {isUploading ? `Загружаю ${uploadStep}… не закрывай окно` : 'Опубликовать на сайте'}
+                {isUploading ? `Загружаю ${uploadStep}${upPct > 0 && upPct < 100 ? ` · ${upPct}%` : ''} — не закрывай окно` : 'Опубликовать на сайте'}
               </button>
               <button onClick={() => setShowAddShoot(false)} disabled={isUploading} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
@@ -1641,26 +1904,27 @@ export default function Home() {
       {/* 2. Модалка "Новый ползунок До/После" */}
       {showAddBA && (
         <div onClick={() => !isUploadingBA && setShowAddBA(false)} style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--paper)', width: '90%', maxWidth: '500px', padding: '32px', borderRadius: '4px', display: 'flex', flexDirection: 'column', gap: '16px', border: '1px solid var(--line-soft)' }}>
+          <div onClick={(e) => e.stopPropagation()} className="modal-card">
             <h2 style={{ margin: '0 0 8px', fontFamily: 'Archivo', fontSize: '24px' }}>Новый ползунок</h2>
             
             <input type="text" placeholder="Заголовок (например: Бьюти-макро)" value={baTitle} onChange={e => setBaTitle(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
             <input type="text" placeholder="Описание (например: Dodge & Burn, Цвет)" value={baNote} onChange={e => setBaNote(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
             
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-              <div style={{ border: '1px dashed var(--ink)', padding: '16px', textAlign: 'center', background: 'var(--paper-2)' }}>
+            <div className="cms-2col tight">
+              <div style={{ border: '1px dashed var(--ink)', padding: '16px', textAlign: 'center', background: 'var(--paper-2)', minWidth: 0 }}>
                  <span style={{ fontSize: '12px', fontWeight: 'bold', display: 'block', marginBottom: '8px' }}>ФОТО ДО (RAW)</span>
                  <input type="file" accept="image/*" onChange={(e) => setBaBefore(e.target.files?.[0] || null)} style={{ width: '100%', fontSize: '11px' }} />
               </div>
-              <div style={{ border: '1px dashed var(--ink)', padding: '16px', textAlign: 'center', background: 'var(--paper-2)' }}>
+              <div style={{ border: '1px dashed var(--ink)', padding: '16px', textAlign: 'center', background: 'var(--paper-2)', minWidth: 0 }}>
                  <span style={{ fontSize: '12px', fontWeight: 'bold', display: 'block', marginBottom: '8px' }}>ФОТО ПОСЛЕ</span>
                  <input type="file" accept="image/*" onChange={(e) => setBaAfter(e.target.files?.[0] || null)} style={{ width: '100%', fontSize: '11px' }} />
               </div>
             </div>
 
+            {baError && <span style={{ fontSize: '12px', color: '#8A3B33', lineHeight: 1.5 }}>{baError}</span>}
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateBA} disabled={isUploadingBA} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploadingBA ? 'wait' : 'pointer' }}>
-                {isUploadingBA ? 'Загрузка…' : 'Добавить'}
+                {isUploadingBA ? ((baStep || 'Загрузка') + (upPct > 0 && upPct < 100 ? ` ${upPct}%` : '…')) : 'Добавить'}
               </button>
               <button onClick={() => setShowAddBA(false)} disabled={isUploadingBA} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
@@ -1811,7 +2075,7 @@ button{font-family:inherit}
 .drawer-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
 .drawer-foot .btn{background:#F4F2EF;color:#0B0B0A;border-color:#F4F2EF}
 .drawer-foot .btn:hover{background:transparent;color:#F4F2EF}
-.drawer-admin{background:none;border:0;cursor:pointer;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#6F6A63}
+.drawer-admin{background:none;border:0;cursor:pointer;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#9A958C;text-decoration:underline;text-underline-offset:4px;padding:6px 0}
 .drawer-admin:hover{color:#F4F2EF}
 
 /* ── hero ── */
@@ -1926,38 +2190,6 @@ textarea{resize:vertical;min-height:88px;line-height:1.55}
 .note{font-size:12px;color:var(--mute);line-height:1.55}
 .ok{border:1px solid var(--ink);padding:22px;font-size:14px;line-height:1.6}
 
-
-/* ── СТИЛИ ДЛЯ БЕЛОЙ ФОРМЫ НА ЧЕРНОМ ФОНЕ ── */
-.testform .form {
-  /* Жестко возвращаем светлые цвета внутри черной секции */
-  --ink: #0B0B0A;
-  --paper: #F4F2EF;
-  --paper-2: #EAE7E2;
-  --line: #D6D2CB;
-  --mute: #7C776E;
-  --accent: #A79E90;
-  
-  background: var(--paper);
-  padding: 40px;
-  border-radius: 8px;
-}
-.testform .form .field > span { color: var(--mute); }
-.testform .form input, .testform .form select, .testform .form textarea { color: var(--ink); border-bottom-color: var(--line); }
-.testform .form input::placeholder, .testform .form textarea::placeholder { color: var(--accent); }
-.testform .form .drop { border-color: var(--line); color: var(--mute); }
-.testform .form .drop.hot { background: var(--paper-2); border-color: var(--ink); }
-.testform .form .pick { color: var(--ink); border-color: var(--ink); }
-.testform .form .btn { background: var(--ink); color: var(--paper); }
-.testform .form .note { color: var(--mute); }
-
-/* Спускаем текст слева (шаги) немного вниз на компьютерах */
-@media (min-width: 861px) {
-  .steps {
-    margin-top: 40px;
-  }
-}
-
-
 /* ── подвал ── */
 footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 @media (min-width:900px){footer,.site-footer{padding:26px 56px 40px}}
@@ -2003,9 +2235,8 @@ footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:
   .hero-cta .btn{flex:1 1 100%;justify-content:center}
   .sec{padding:52px 20px 58px}
   .sec-head{padding-bottom:26px}
-  /* НОВОЕ: Журнальная сетка на мобилках */
-  .mrow { gap: 10px; }
-  .cell { min-height: 120px; }
+  .mrow{flex-wrap:wrap;gap:10px}
+  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
   .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
   .site-footer{padding-bottom:96px}
   .mob-cta{display:flex;position:fixed;left:14px;right:14px;bottom:14px;z-index:88;align-items:center;justify-content:center;gap:10px;padding:16px;background:#0B0B0A;color:#F4F2EF;text-decoration:none;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;box-shadow:0 10px 30px rgba(11,11,10,.25);transform:translateY(140%);transition:transform .35s cubic-bezier(.2,.7,.2,1)}
@@ -2028,7 +2259,9 @@ const CSS = `
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--paper);color:var(--ink);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
-.app{min-height:100vh;background:var(--paper);color:var(--ink)}
+.app{min-height:100vh;background:var(--paper);color:var(--ink);overflow-x:hidden}
+img{max-width:100%}
+input,select,textarea{max-width:100%}
 
 .mono-label{font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:var(--mute)}
 .display{font-family:'Archivo',sans-serif;font-weight:800;letter-spacing:-.035em;line-height:.86;text-transform:lowercase}
@@ -2042,7 +2275,9 @@ header { display:flex; align-items:center; justify-content:space-between; gap:24
 .logo svg{display:block}
 .logo-word{font-family:'Archivo',sans-serif;font-weight:800;font-size:19px;letter-spacing:.16em;text-transform:uppercase}
 .logo-sub{font-family:'Archivo',sans-serif;font-weight:400;font-size:19px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute)}
-.header-meta{display:flex;gap:28px}
+.header-meta{display:flex;gap:28px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.logout{appearance:none;background:none;border:1px solid var(--ink);cursor:pointer;color:var(--ink);font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;padding:8px 12px;white-space:nowrap}
+.logout:hover{background:var(--ink);color:var(--paper)}
 
 .hero{padding:30px 24px 20px}
 .hero-over{font-family:'Archivo',sans-serif;font-weight:800;text-transform:lowercase;letter-spacing:-.01em;color:rgba(11,11,10,.08);font-size:clamp(32px, 6vw, 56px);line-height:.9;margin:0 0 -1.8vw 2px;position:relative;z-index:1}
@@ -2059,6 +2294,23 @@ nav.tabs::-webkit-scrollbar{display:none}
 .tab:hover{color:var(--ink)}
 .tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
 .tab .num{color:var(--accent);margin-right:8px}
+
+.cms-tabs{display:flex;flex-wrap:wrap;gap:10px;border-bottom:1px solid var(--line-soft);padding-bottom:16px;margin-bottom:32px}
+.cms-tabs .badge{white-space:nowrap}
+.cms-2col{display:grid;grid-template-columns:1fr 1fr;gap:40px}
+.cms-2col.tight{gap:16px}
+.cms-search{display:grid;grid-template-columns:1fr 2fr;gap:24px}
+.cms-2col>*,.cms-search>*{min-width:0}
+.shoot-row{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.ph-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+.ph{position:relative;border:1px solid var(--line-soft);background:var(--paper);min-width:0}
+.ph.is-cover{border-color:var(--ink)}
+.ph img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover}
+.ph-acts{display:flex;justify-content:space-between;gap:8px;padding:6px 8px;border-top:1px solid var(--line-soft)}
+.ph-acts button{appearance:none;background:none;border:0;cursor:pointer;color:var(--mute);font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.14em;text-transform:uppercase;padding:2px 0;text-decoration:underline}
+.ph-acts button:hover{color:var(--ink)}
+.ph-tag{font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink)}
+.modal-card{background:var(--paper);width:min(500px,calc(100vw - 28px));max-height:88vh;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:32px;display:flex;flex-direction:column;gap:16px;border:1px solid var(--line-soft)}
 
 main{padding:0 24px 96px}
 .sheet{background:var(--paper-2);border:1px solid var(--line-soft);border-top:0;padding:44px 32px 40px}
@@ -2099,9 +2351,17 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
   .sheet{padding:64px 56px 56px}
   .stat{padding-left:32px}
 }
+@media (max-width:980px){
+  .cms-2col,.cms-search{grid-template-columns:1fr;gap:22px}
+}
 @media (max-width:768px){
-  .header-meta{display:none}
+  header{flex-wrap:wrap;gap:12px;padding:12px 20px}
+  .header-meta .mono-label{display:none}
   .strip span:nth-child(2){display:none}
+  .modal-card{padding:22px 18px;max-height:92vh}
+  .ph-grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:10px}
+  nav.tabs{padding:0 20px}
+  main{padding:0 20px 80px}
   .module{grid-template-columns:1fr;gap:28px}
   .stats{grid-template-columns:1fr}
   .stat{border-right:0;border-bottom:1px solid var(--line-soft);padding:22px 0}
@@ -2116,23 +2376,8 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
-.cell {
-  position: relative;
-  overflow: hidden;
-  cursor: zoom-in;
-  background: transparent; /* Убрали серый фон, чтобы фото парили */
-  min-width: 0;
-  margin: 0;
-}
-.cell img {
-  width: 100%;
-  height: 100%;
-  /* contain — втягивает фото целиком, сохраняя все пропорции */
-  object-fit: contain; 
-  object-position: center;
-  transition: transform .8s cubic-bezier(.2,.7,.2,1), filter .4s;
-}
-
+.cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0; margin:0;}
+.cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
 .cell::after{content:attr(data-n);position:absolute;left:10px;bottom:8px;font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.2em;color:#fff;opacity:0;transition:opacity .3s;text-shadow:0 1px 6px rgba(0,0,0,.5)}
 .cell:hover::after{opacity:1}
