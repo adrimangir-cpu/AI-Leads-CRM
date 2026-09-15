@@ -17,8 +17,7 @@
 
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
-import { db, auth, storage } from '../firebase';
-import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { db, auth } from '../firebase';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
@@ -118,74 +117,55 @@ async function loadBitmap(file) {
   }
 }
 
-/* Загрузка в Storage.
-   Сначала пробуем возобновляемый режим — он даёт процент. Если за 8 секунд
-   не ушло ни одного байта (частая причина: в CORS хранилища не разрешены
-   служебные заголовки x-goog-upload-*), молча переключаемся на простую
-   загрузку одним куском со своим таймаутом. Так процент есть там, где он
-   возможен, а загрузка не зависает там, где нет. */
-function withTimeout(promise, ms, message) {
-  let timer;
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
-  ]);
+/* Хранилище фотографий — Cloudinary.
+   Загрузка идёт «неподписанным» способом (unsigned upload preset), поэтому
+   в коде нет ни одного секрета: нужны только два публичных значения —
+   имя облака и имя preset. Они лежат в site_settings/public и задаются
+   в дашборде, в блоке «Хранилище фотографий». XMLHttpRequest выбран
+   вместо fetch ради честного процента загрузки. */
+function storageConfig(settings) {
+  return {
+    cloud: (settings && settings.cloudName) || process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD || '',
+    preset: (settings && settings.uploadPreset) || process.env.NEXT_PUBLIC_CLOUDINARY_PRESET || '',
+  };
 }
 
-function tryResumable(fileRef, blob, onProgress) {
+function uploadImage(blob, folder, cfg, onProgress) {
   return new Promise((resolve, reject) => {
-    let task;
-    try {
-      task = uploadBytesResumable(fileRef, blob, { contentType: 'image/jpeg' });
-    } catch (e) { reject(new Error('RESUMABLE_UNAVAILABLE')); return; }
-    let moved = false;
-    let last = Date.now();
-    const stop = setInterval(() => {
-      const idle = Date.now() - last;
-      if (!moved && idle > 8000) {
-        clearInterval(stop);
-        try { task.cancel(); } catch (e) { /* уже завершилась */ }
-        reject(new Error('RESUMABLE_STALLED'));
-      } else if (moved && idle > 45000) {
-        clearInterval(stop);
-        try { task.cancel(); } catch (e) { /* уже завершилась */ }
-        reject(new Error('связь пропала на середине загрузки — попробуй ещё раз, лучше по Wi-Fi'));
-      }
-    }, 2000);
-    task.on('state_changed',
-      (snap) => {
-        last = Date.now();
-        if (snap.bytesTransferred > 0) moved = true;
-        if (onProgress && snap.totalBytes) onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
-      },
-      (err) => {
-        clearInterval(stop);
-        const code = err && err.code ? String(err.code) : '';
-        if (!moved && /retry-limit|unknown|canceled/.test(code)) reject(new Error('RESUMABLE_STALLED'));
-        else if (/unauthorized|unauthenticated/.test(code)) reject(new Error('хранилище не разрешает запись (правила Storage) — ' + code));
-        else reject(new Error(code || err.message || 'хранилище не приняло файл'));
-      },
-      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve('resumable'); }
-    );
-  });
-}
+    if (!cfg || !cfg.cloud || !cfg.preset) {
+      reject(new Error('не заданы имя облака и upload preset — впиши их в блоке «Хранилище фотографий» и сохрани'));
+      return;
+    }
+    const form = new FormData();
+    form.append('file', blob);
+    form.append('upload_preset', cfg.preset);
+    if (folder) form.append('folder', folder);
 
-async function uploadWithProgress(fileRef, blob, onProgress) {
-  try {
-    return await tryResumable(fileRef, blob, onProgress);
-  } catch (e) {
-    const m = e && e.message ? e.message : '';
-    if (m !== 'RESUMABLE_STALLED' && m !== 'RESUMABLE_UNAVAILABLE') throw e;
-  }
-  // запасной путь: простая загрузка, без процента, но со своим таймаутом
-  if (onProgress) onProgress(-1);
-  await withTimeout(
-    uploadBytes(fileRef, blob, { contentType: 'image/jpeg' }),
-    150000,
-    'файл не загрузился за 2,5 минуты — проверь связь и попробуй по Wi-Fi'
-  );
-  if (onProgress) onProgress(100);
-  return 'simple';
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `https://api.cloudinary.com/v1_1/${cfg.cloud}/image/upload`);
+    xhr.timeout = 180000;
+    if (xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (onProgress && e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+      };
+    }
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* пустой ответ */ }
+      if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
+        if (onProgress) onProgress(100);
+        resolve({ url: data.secure_url, w: data.width || 0, h: data.height || 0, path: data.public_id || '' });
+        return;
+      }
+      const msg = (data.error && data.error.message) || ('код ' + xhr.status);
+      if (/preset/i.test(msg)) reject(new Error('Cloudinary не принял preset («' + msg + '») — проверь имя и что режим стоит Unsigned'));
+      else if (/unknown api key|invalid cloud/i.test(msg) || xhr.status === 404) reject(new Error('Cloudinary не узнал облако «' + cfg.cloud + '» — проверь Cloud name на главной странице аккаунта'));
+      else reject(new Error('Cloudinary отклонил загрузку: ' + msg));
+    };
+    xhr.onerror = () => reject(new Error('запрос не дошёл до Cloudinary — проверь Cloud name и соединение'));
+    xhr.ontimeout = () => reject(new Error('файл не загрузился за 3 минуты — попробуй ещё раз'));
+    xhr.send(form);
+  });
 }
 
 async function compressImage(file, maxSide = 1600, quality = 0.82) {
@@ -872,6 +852,9 @@ export default function Home() {
   const [upPct, setUpPct] = useState(0);
   const [shootBusyId, setShootBusyId] = useState('');
   const [openShootId, setOpenShootId] = useState('');
+  const [cloudName, setCloudName] = useState('');
+  const [uploadPreset, setUploadPreset] = useState('');
+  const storeCfg = storageConfig({ cloudName, uploadPreset });
 
   // Эффект: загрузка входящих заявок
   useEffect(() => {
@@ -913,6 +896,8 @@ export default function Home() {
       setEditWa(publicSettings.contacts?.whatsapp?.url || '');
       setEditIg(publicSettings.contacts?.instagram?.url || '');
       setEditEmail(publicSettings.contacts?.email?.url?.replace('mailto:', '') || '');
+      setCloudName(publicSettings.cloudName || '');
+      setUploadPreset(publicSettings.uploadPreset || '');
     }
   }, [publicSettings]);
 
@@ -976,6 +961,8 @@ export default function Home() {
       aboutNote: editAboutNote,
       about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
       contacts,
+      cloudName: cloudName.trim(),
+      uploadPreset: uploadPreset.trim(),
       facts: publicSettings?.facts || [
         { label: 'Опыт', value: '06', note: 'лет в постобработке' },
         { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
@@ -1000,11 +987,9 @@ export default function Home() {
       for (let i = 0; i < shootFiles.length; i++) {
         setUploadStep(`${i + 1} / ${shootFiles.length}`);
         const { blob, w, h: hh } = await compressImage(shootFiles[i], 1600, 0.82);
-        const path = `portfolio/${stamp}_${String(i + 1).padStart(2, '0')}.jpg`;
-        const fileRef = ref(storage, path);
         setUpPct(0);
-        await uploadWithProgress(fileRef, blob, setUpPct);
-        photos.push({ url: await getDownloadURL(fileRef), w, h: hh, path });
+        const up = await uploadImage(blob, 'portfolio', storeCfg, setUpPct);
+        photos.push({ url: up.url, w: up.w || w, h: up.h || hh, path: up.path });
       }
       const newShoot = {
         title: shootTitle.trim(),
@@ -1039,10 +1024,9 @@ export default function Home() {
       catch (e) { throw new Error('кадр «до»: ' + e.message); }
 
       setBaStep('загружаю кадр «до»');
-      const refB = ref(storage, `before_after/${stamp}_before.jpg`);
       setUpPct(0);
-      await uploadWithProgress(refB, before.blob, setUpPct);
-      const beforeUrl = await getDownloadURL(refB);
+      const upBefore = await uploadImage(before.blob, 'before_after', storeCfg, setUpPct);
+      const beforeUrl = upBefore.url;
 
       setBaStep('готовлю кадр «после»');
       let after;
@@ -1050,10 +1034,9 @@ export default function Home() {
       catch (e) { throw new Error('кадр «после»: ' + e.message); }
 
       setBaStep('загружаю кадр «после»');
-      const refA = ref(storage, `before_after/${stamp}_after.jpg`);
       setUpPct(0);
-      await uploadWithProgress(refA, after.blob, setUpPct);
-      const afterUrl = await getDownloadURL(refA);
+      const upAfter = await uploadImage(after.blob, 'before_after', storeCfg, setUpPct);
+      const afterUrl = upAfter.url;
 
       setBaStep('сохраняю на сайт');
       const newBA = { title: baTitle.trim(), note: baNote.trim(), beforeUrl, afterUrl, order: stamp };
@@ -1079,9 +1062,8 @@ export default function Home() {
     try {
       setUpPct(0);
       const { blob } = await compressImage(file, 1800, 0.84);
-      const fileRef = ref(storage, `portfolio/site_${kind}_${Date.now()}.jpg`);
-      await uploadWithProgress(fileRef, blob, setUpPct);
-      const url = await getDownloadURL(fileRef);
+      const up = await uploadImage(blob, 'site', storeCfg, setUpPct);
+      const url = up.url;
       const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
       await setDoc(doc(db, 'site_settings', 'public'), { [field]: url }, { merge: true });
       setPublicSettings(prev => ({ ...(prev || {}), [field]: url }));
@@ -1123,11 +1105,9 @@ export default function Home() {
       for (let i = 0; i < list.length; i++) {
         setUploadStep(`${i + 1} / ${list.length}`);
         const { blob, w, h } = await compressImage(list[i], 1600, 0.82);
-        const path = `portfolio/${stamp}_add_${String(i + 1).padStart(2, '0')}.jpg`;
-        const fileRef = ref(storage, path);
         setUpPct(0);
-        await uploadWithProgress(fileRef, blob, setUpPct);
-        added.push({ url: await getDownloadURL(fileRef), w, h, path });
+        const up = await uploadImage(blob, 'portfolio', storeCfg, setUpPct);
+        added.push({ url: up.url, w: up.w || w, h: up.h || h, path: up.path });
       }
       const photos = [...(shoot.photos || []), ...added];
       const cover = shoot.cover || photos[0]?.url || '';
@@ -1589,7 +1569,7 @@ export default function Home() {
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Фото сайта</h3>
                     <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
                       Титульный кадр и портрет для раздела «Обо мне» ставятся только здесь. Сайт не берёт фото из съёмок автоматически.
-                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке видно, что идёт.
+                      На кнопке виден процент загрузки.
                     </p>
                     {siteImgError && <span style={{ fontSize: '12px', color: '#8A3B33' }}>{siteImgError}</span>}
                     <div className="cms-2col tight">
@@ -1617,6 +1597,20 @@ export default function Home() {
                     <input value={editWa} onChange={e => setEditWa(e.target.value)} type="text" placeholder="WhatsApp URL (https://wa.me/48...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editIg} onChange={e => setEditIg(e.target.value)} type="text" placeholder="Instagram URL (https://instagram.com/...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editEmail} onChange={e => setEditEmail(e.target.value)} type="text" placeholder="Email (почта@домен.com)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+
+                    <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Хранилище фотографий</h3>
+                    <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
+                      Все фото уходят в Cloudinary. Два значения из его настроек: Cloud name на главной странице аккаунта,
+                      Upload preset в Settings · Upload, режим Unsigned. Это публичные имена, не пароли.
+                    </p>
+                    <input value={cloudName} onChange={e => setCloudName(e.target.value)} type="text" placeholder="Cloud name (например dq8xk2abc)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+                    <input value={uploadPreset} onChange={e => setUploadPreset(e.target.value)} type="text" placeholder="Upload preset (например adriana_unsigned)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+                    <span style={{ fontSize: '12px', color: storeCfg.cloud && storeCfg.preset ? 'var(--mute)' : '#8A3B33' }}>
+                      {storeCfg.cloud && storeCfg.preset
+                        ? 'Значения заполнены — можно пробовать загрузку.'
+                        : 'Пока не заполнено — загрузка фото выдаст ошибку.'}
+                    </span>
+                    <button onClick={handleSaveSettings} className="badge solid" style={{ padding: '12px', cursor: 'pointer', border: 'none', width: 'fit-content' }}>Сохранить хранилище</button>
                   </div>
                 </div>
               )}
