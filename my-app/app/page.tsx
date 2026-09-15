@@ -18,7 +18,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
 import { db, auth, storage } from '../firebase';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
@@ -116,6 +116,34 @@ async function loadBitmap(file) {
   } finally {
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
+}
+
+/* Загрузка в Storage с процентом и сторожевым таймером:
+   если минуту нет ни одного байта прогресса — отменяем и говорим прямо,
+   что связь пропала, вместо бесконечного «Загружаю…». */
+function uploadWithProgress(fileRef, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    let task;
+    try {
+      task = uploadBytesResumable(fileRef, blob, { contentType: 'image/jpeg' });
+    } catch (e) { reject(new Error('не удалось начать загрузку (' + (e.code || e.message) + ')')); return; }
+    let last = Date.now();
+    const stop = setInterval(() => {
+      if (Date.now() - last > 60000) {
+        clearInterval(stop);
+        try { task.cancel(); } catch (e) { /* уже завершилась */ }
+        reject(new Error('связь пропала на минуту, файл не догрузился — попробуй ещё раз, лучше по Wi-Fi'));
+      }
+    }, 4000);
+    task.on('state_changed',
+      (snap) => {
+        last = Date.now();
+        if (onProgress && snap.totalBytes) onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
+      },
+      (err) => { clearInterval(stop); reject(new Error(err.code || err.message || 'хранилище не приняло файл')); },
+      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve(); }
+    );
+  });
 }
 
 async function compressImage(file, maxSide = 1600, quality = 0.82) {
@@ -799,6 +827,7 @@ export default function Home() {
   const [siteImgBusy, setSiteImgBusy] = useState('');
   const [siteImgError, setSiteImgError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [upPct, setUpPct] = useState(0);
   const [shootBusyId, setShootBusyId] = useState('');
   const [openShootId, setOpenShootId] = useState('');
 
@@ -931,7 +960,8 @@ export default function Home() {
         const { blob, w, h: hh } = await compressImage(shootFiles[i], 1600, 0.82);
         const path = `portfolio/${stamp}_${String(i + 1).padStart(2, '0')}.jpg`;
         const fileRef = ref(storage, path);
-        await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+        setUpPct(0);
+        await uploadWithProgress(fileRef, blob, setUpPct);
         photos.push({ url: await getDownloadURL(fileRef), w, h: hh, path });
       }
       const newShoot = {
@@ -968,9 +998,8 @@ export default function Home() {
 
       setBaStep('загружаю кадр «до»');
       const refB = ref(storage, `before_after/${stamp}_before.jpg`);
-      try {
-        await uploadBytes(refB, before.blob, { contentType: 'image/jpeg' });
-      } catch (e) { throw new Error('хранилище отклонило кадр «до» (' + (e.code || e.message) + ')'); }
+      setUpPct(0);
+      await uploadWithProgress(refB, before.blob, setUpPct);
       const beforeUrl = await getDownloadURL(refB);
 
       setBaStep('готовлю кадр «после»');
@@ -980,9 +1009,8 @@ export default function Home() {
 
       setBaStep('загружаю кадр «после»');
       const refA = ref(storage, `before_after/${stamp}_after.jpg`);
-      try {
-        await uploadBytes(refA, after.blob, { contentType: 'image/jpeg' });
-      } catch (e) { throw new Error('хранилище отклонило кадр «после» (' + (e.code || e.message) + ')'); }
+      setUpPct(0);
+      await uploadWithProgress(refA, after.blob, setUpPct);
       const afterUrl = await getDownloadURL(refA);
 
       setBaStep('сохраняю на сайт');
@@ -997,6 +1025,7 @@ export default function Home() {
     } finally {
       setIsUploadingBA(false);
       setBaStep('');
+      setUpPct(0);
     }
   };
 
@@ -1006,9 +1035,10 @@ export default function Home() {
     setSiteImgError('');
     setSiteImgBusy(kind);
     try {
-      const { blob } = await compressImage(file, kind === 'hero' ? 2000 : 1600, 0.86);
-      const fileRef = ref(storage, `site/${kind}_${Date.now()}.jpg`);
-      await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+      setUpPct(0);
+      const { blob } = await compressImage(file, 1800, 0.84);
+      const fileRef = ref(storage, `portfolio/site_${kind}_${Date.now()}.jpg`);
+      await uploadWithProgress(fileRef, blob, setUpPct);
       const url = await getDownloadURL(fileRef);
       const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
       await setDoc(doc(db, 'site_settings', 'public'), { [field]: url }, { merge: true });
@@ -1017,6 +1047,7 @@ export default function Home() {
       setSiteImgError((kind === 'hero' ? 'Титульное фото: ' : 'Портрет: ') + (e.message || e.code || 'ошибка'));
     } finally {
       setSiteImgBusy('');
+      setUpPct(0);
     }
   };
 
@@ -1052,7 +1083,8 @@ export default function Home() {
         const { blob, w, h } = await compressImage(list[i], 1600, 0.82);
         const path = `portfolio/${stamp}_add_${String(i + 1).padStart(2, '0')}.jpg`;
         const fileRef = ref(storage, path);
-        await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+        setUpPct(0);
+        await uploadWithProgress(fileRef, blob, setUpPct);
         added.push({ url: await getDownloadURL(fileRef), w, h, path });
       }
       const photos = [...(shoot.photos || []), ...added];
@@ -1064,6 +1096,7 @@ export default function Home() {
     } finally {
       setShootBusyId('');
       setUploadStep('');
+      setUpPct(0);
     }
   };
 
@@ -1514,6 +1547,7 @@ export default function Home() {
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Фото сайта</h3>
                     <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
                       Титульный кадр и портрет для раздела «Обо мне» ставятся только здесь. Сайт не берёт фото из съёмок автоматически.
+                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке виден процент.
                     </p>
                     {siteImgError && <span style={{ fontSize: '12px', color: '#8A3B33' }}>{siteImgError}</span>}
                     <div className="cms-2col tight">
@@ -1526,7 +1560,7 @@ export default function Home() {
                               : <span style={{ fontSize: '12px', color: 'var(--mute)', textAlign: 'center', padding: '10px' }}>пока не выбрано</span>}
                           </div>
                           <label className="badge solid" style={{ cursor: 'pointer', textAlign: 'center', padding: '10px 12px' }}>
-                            {siteImgBusy === kind ? 'Загружаю…' : (url ? 'Заменить' : 'Выбрать фото')}
+                            {siteImgBusy === kind ? (upPct > 0 ? `Загружаю ${upPct}%` : 'Готовлю кадр…') : (url ? 'Заменить' : 'Выбрать фото')}
                             <input type="file" accept="image/*" hidden disabled={siteImgBusy === kind}
                               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; handleUploadSiteImage(kind, f); }} />
                           </label>
@@ -1589,7 +1623,7 @@ export default function Home() {
                                ))}
                              </div>
                              <label className="badge" style={{ display: 'inline-block', marginTop: '14px', cursor: 'pointer', border: '1px solid var(--ink)' }}>
-                               {shootBusyId === s.id ? `Загружаю ${uploadStep}…` : '+ Добавить кадры'}
+                               {shootBusyId === s.id ? `Загружаю ${uploadStep}${upPct > 0 && upPct < 100 ? ` · ${upPct}%` : ''}` : '+ Добавить кадры'}
                                <input type="file" accept="image/*" multiple hidden disabled={shootBusyId === s.id}
                                  onChange={(e) => { const f = e.target.files; e.target.value = ''; handleAddPhotosToShoot(s, f); }} />
                              </label>
@@ -1817,7 +1851,7 @@ export default function Home() {
             {shootError && <span style={{ fontSize: '12px', color: '#8A3B33', lineHeight: 1.5 }}>{shootError}</span>}
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateShoot} disabled={isUploading} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploading ? 'wait' : 'pointer' }}>
-                {isUploading ? `Загружаю ${uploadStep}… не закрывай окно` : 'Опубликовать на сайте'}
+                {isUploading ? `Загружаю ${uploadStep}${upPct > 0 && upPct < 100 ? ` · ${upPct}%` : ''} — не закрывай окно` : 'Опубликовать на сайте'}
               </button>
               <button onClick={() => setShowAddShoot(false)} disabled={isUploading} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
@@ -1848,7 +1882,7 @@ export default function Home() {
             {baError && <span style={{ fontSize: '12px', color: '#8A3B33', lineHeight: 1.5 }}>{baError}</span>}
             <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
               <button onClick={handleCreateBA} disabled={isUploadingBA} className="badge solid" style={{ flex: 1, padding: '14px', border: 'none', cursor: isUploadingBA ? 'wait' : 'pointer' }}>
-                {isUploadingBA ? (baStep ? baStep + '…' : 'Загрузка…') : 'Добавить'}
+                {isUploadingBA ? ((baStep || 'Загрузка') + (upPct > 0 && upPct < 100 ? ` ${upPct}%` : '…')) : 'Добавить'}
               </button>
               <button onClick={() => setShowAddBA(false)} disabled={isUploadingBA} className="badge" style={{ padding: '14px', border: '1px solid var(--ink)', background: 'transparent', cursor: 'pointer' }}>Отмена</button>
             </div>
