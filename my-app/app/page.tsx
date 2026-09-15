@@ -18,7 +18,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
 import { db, auth, storage } from '../firebase';
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
@@ -118,32 +118,74 @@ async function loadBitmap(file) {
   }
 }
 
-/* Загрузка в Storage с процентом и сторожевым таймером:
-   если минуту нет ни одного байта прогресса — отменяем и говорим прямо,
-   что связь пропала, вместо бесконечного «Загружаю…». */
-function uploadWithProgress(fileRef, blob, onProgress) {
+/* Загрузка в Storage.
+   Сначала пробуем возобновляемый режим — он даёт процент. Если за 8 секунд
+   не ушло ни одного байта (частая причина: в CORS хранилища не разрешены
+   служебные заголовки x-goog-upload-*), молча переключаемся на простую
+   загрузку одним куском со своим таймаутом. Так процент есть там, где он
+   возможен, а загрузка не зависает там, где нет. */
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+  ]);
+}
+
+function tryResumable(fileRef, blob, onProgress) {
   return new Promise((resolve, reject) => {
     let task;
     try {
       task = uploadBytesResumable(fileRef, blob, { contentType: 'image/jpeg' });
-    } catch (e) { reject(new Error('не удалось начать загрузку (' + (e.code || e.message) + ')')); return; }
+    } catch (e) { reject(new Error('RESUMABLE_UNAVAILABLE')); return; }
+    let moved = false;
     let last = Date.now();
     const stop = setInterval(() => {
-      if (Date.now() - last > 60000) {
+      const idle = Date.now() - last;
+      if (!moved && idle > 8000) {
         clearInterval(stop);
         try { task.cancel(); } catch (e) { /* уже завершилась */ }
-        reject(new Error('связь пропала на минуту, файл не догрузился — попробуй ещё раз, лучше по Wi-Fi'));
+        reject(new Error('RESUMABLE_STALLED'));
+      } else if (moved && idle > 45000) {
+        clearInterval(stop);
+        try { task.cancel(); } catch (e) { /* уже завершилась */ }
+        reject(new Error('связь пропала на середине загрузки — попробуй ещё раз, лучше по Wi-Fi'));
       }
-    }, 4000);
+    }, 2000);
     task.on('state_changed',
       (snap) => {
         last = Date.now();
+        if (snap.bytesTransferred > 0) moved = true;
         if (onProgress && snap.totalBytes) onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
       },
-      (err) => { clearInterval(stop); reject(new Error(err.code || err.message || 'хранилище не приняло файл')); },
-      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve(); }
+      (err) => {
+        clearInterval(stop);
+        const code = err && err.code ? String(err.code) : '';
+        if (!moved && /retry-limit|unknown|canceled/.test(code)) reject(new Error('RESUMABLE_STALLED'));
+        else if (/unauthorized|unauthenticated/.test(code)) reject(new Error('хранилище не разрешает запись (правила Storage) — ' + code));
+        else reject(new Error(code || err.message || 'хранилище не приняло файл'));
+      },
+      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve('resumable'); }
     );
   });
+}
+
+async function uploadWithProgress(fileRef, blob, onProgress) {
+  try {
+    return await tryResumable(fileRef, blob, onProgress);
+  } catch (e) {
+    const m = e && e.message ? e.message : '';
+    if (m !== 'RESUMABLE_STALLED' && m !== 'RESUMABLE_UNAVAILABLE') throw e;
+  }
+  // запасной путь: простая загрузка, без процента, но со своим таймаутом
+  if (onProgress) onProgress(-1);
+  await withTimeout(
+    uploadBytes(fileRef, blob, { contentType: 'image/jpeg' }),
+    150000,
+    'файл не загрузился за 2,5 минуты — проверь связь и попробуй по Wi-Fi'
+  );
+  if (onProgress) onProgress(100);
+  return 'simple';
 }
 
 async function compressImage(file, maxSide = 1600, quality = 0.82) {
@@ -1547,7 +1589,7 @@ export default function Home() {
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Фото сайта</h3>
                     <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
                       Титульный кадр и портрет для раздела «Обо мне» ставятся только здесь. Сайт не берёт фото из съёмок автоматически.
-                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке виден процент.
+                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке видно, что идёт.
                     </p>
                     {siteImgError && <span style={{ fontSize: '12px', color: '#8A3B33' }}>{siteImgError}</span>}
                     <div className="cms-2col tight">
@@ -1560,7 +1602,7 @@ export default function Home() {
                               : <span style={{ fontSize: '12px', color: 'var(--mute)', textAlign: 'center', padding: '10px' }}>пока не выбрано</span>}
                           </div>
                           <label className="badge solid" style={{ cursor: 'pointer', textAlign: 'center', padding: '10px 12px' }}>
-                            {siteImgBusy === kind ? (upPct > 0 ? `Загружаю ${upPct}%` : 'Готовлю кадр…') : (url ? 'Заменить' : 'Выбрать фото')}
+                            {siteImgBusy === kind ? (upPct > 0 ? `Загружаю ${upPct}%` : upPct < 0 ? 'Загружаю, это может занять минуту…' : 'Готовлю кадр…') : (url ? 'Заменить' : 'Выбрать фото')}
                             <input type="file" accept="image/*" hidden disabled={siteImgBusy === kind}
                               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; handleUploadSiteImage(kind, f); }} />
                           </label>
