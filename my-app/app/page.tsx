@@ -584,7 +584,6 @@ function PublicSite({ onAdminClick }) {
             <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
             <a href="#work" className="btn ghost">Смотреть работы</a>
           </div>
-          <p className="hero-hint">Первый кадр обрабатываю бесплатно — чтобы ты увидела подход до заказа.</p>
         </div>
         <figure className="hero-img">
           {heroPhoto
@@ -601,7 +600,7 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">01 — about</div>
             <h2 className="display sec-title">обо мне</h2>
           </div>
-          <p className="sec-note">{settings?.aboutNote || 'Шесть лет в цвете и ретуши. Половина работ — коммерческие съёмки, половина — авторские проекты фотографов.'}</p>
+          {settings?.aboutNote ? <p className="sec-note">{settings.aboutNote}</p> : null}
         </div>
         <div className="about">
           {aboutPhoto ? <img src={aboutPhoto} alt="Адриана, ретушёр" /> : <div className="about-empty" />}
@@ -632,7 +631,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">02 — portfolio</div>
             <h2 className="display sec-title">портфолио</h2>
           </div>
-          <p className="sec-note">Выбери категорию — внутри работы собраны по съёмкам, так же как они приходят из студии.</p>
         </div>
 
         <div className="cats" role="tablist">
@@ -655,7 +653,10 @@ function PublicSite({ onAdminClick }) {
         {visible.map((s) => (
           <article className="shoot" key={s.id}>
             <header className="shoot-head">
-              <h3 className="shoot-name">{s.title}</h3>
+              <div className="shoot-t">
+                <h3 className="shoot-name">{s.title}</h3>
+                {s.team ? <div className="shoot-team">{s.team}</div> : null}
+              </div>
               <div className="shoot-meta">
                 <span className="label">{s.photos.length} {plural(s.photos.length)}</span>
                 {s.year && <span className="label">{s.year}</span>}
@@ -694,7 +695,6 @@ function PublicSite({ onAdminClick }) {
               <div className="sec-num">03 — before / after</div>
               <h2 className="display sec-title">до / после</h2>
             </div>
-            <p className="sec-note">Потяни ползунок. Слева — кадр из камеры, справа — после моей обработки.</p>
           </div>
           <div className="ba-grid">
             {ba.map((item) => <BeforeAfter key={item.id} item={item} />)}
@@ -709,7 +709,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">04 — contact</div>
             <h2 className="display sec-title">связаться</h2>
           </div>
-          <p className="sec-note">Нажми на удобный мессенджер — откроется сразу диалог со мной.</p>
         </div>
         <div className="chgrid">
           {[
@@ -734,7 +733,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">05 — test</div>
             <h2 className="display sec-title">фото на тест</h2>
           </div>
-          <p className="sec-note">Один кадр — бесплатно. Напиши пару слов, приложи фото, и заявка придёт мне в Telegram.</p>
         </div>
         <div className="testgrid">
           <div className="steps">
@@ -833,7 +831,10 @@ export default function Home() {
   const [shootTitle, setShootTitle] = useState('');
   const [shootCategory, setShootCategory] = useState('beauty');
   const [shootYear, setShootYear] = useState('');
+  const [shootTeam, setShootTeam] = useState('');
   const [shootFiles, setShootFiles] = useState([]);
+  const [teamDraft, setTeamDraft] = useState({});   // id съёмки → текст команды, пока правим
+  const [teamSavedId, setTeamSavedId] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStep, setUploadStep] = useState('');
 
@@ -995,6 +996,7 @@ export default function Home() {
         title: shootTitle.trim(),
         category: shootCategory,
         year: shootYear.trim(),
+        team: shootTeam.trim(),
         order: stamp,
         photos,
         cover: photos[0]?.url || '',
@@ -1002,7 +1004,7 @@ export default function Home() {
       const docRef = await addDoc(collection(db, 'portfolio_shoots'), newShoot);
       setPublicShoots(prev => [...prev, { id: docRef.id, ...newShoot }]);
       setShowAddShoot(false);
-      setShootTitle(''); setShootFiles([]); setShootYear('');
+      setShootTitle(''); setShootFiles([]); setShootYear(''); setShootTeam('');
     } catch (error) {
       setShootError('Не загрузилось: ' + (error.message || error.code || 'неизвестная ошибка'));
     } finally {
@@ -1079,6 +1081,16 @@ export default function Home() {
     const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
     await setDoc(doc(db, 'site_settings', 'public'), { [field]: '' }, { merge: true });
     setPublicSettings(prev => ({ ...(prev || {}), [field]: '' }));
+  };
+
+  // Команда съёмки: одно свободное поле, выводится строкой под названием
+  const handleSaveTeam = async (shoot) => {
+    const team = (teamDraft[shoot.id] !== undefined ? teamDraft[shoot.id] : (shoot.team || '')).trim();
+    await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { team });
+    setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, team } : x)));
+    setTeamDraft(prev => ({ ...prev, [shoot.id]: team }));
+    setTeamSavedId(shoot.id);
+    setTimeout(() => setTeamSavedId(''), 2600);
   };
 
   // Кадры внутри съёмки: обложка, удаление, добавление
@@ -1645,6 +1657,20 @@ export default function Home() {
 
                          {openShootId === s.id && (
                            <div style={{ marginTop: '16px', borderTop: '1px solid var(--line-soft)', paddingTop: '16px' }}>
+                             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '18px' }}>
+                               <span className="mono-label">Команда съёмки</span>
+                               <textarea
+                                 rows={2}
+                                 placeholder="Фото — Аня К. · Модель — Саша · MUAH — Лера"
+                                 value={teamDraft[s.id] !== undefined ? teamDraft[s.id] : (s.team || '')}
+                                 onChange={e => setTeamDraft(prev => ({ ...prev, [s.id]: e.target.value }))}
+                                 style={{ padding: '10px 12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit', fontSize: '13px', resize: 'vertical' }}
+                               />
+                               <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
+                                 <button onClick={() => handleSaveTeam(s)} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '9px 16px' }}>Сохранить команду</button>
+                                 {teamSavedId === s.id && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>Сохранено, сайт обновлён</span>}
+                               </div>
+                             </div>
                              <div className="ph-grid">
                                {(s.photos || []).map((ph, i) => (
                                  <div key={ph.url + i} className={`ph ${s.cover === ph.url ? 'is-cover' : ''}`}>
@@ -1878,6 +1904,8 @@ export default function Home() {
             </select>
 
             <input type="text" placeholder="Год (необязательно, например: 2026)" value={shootYear} onChange={e => setShootYear(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
+
+            <textarea rows={2} placeholder="Команда (например: Фото — Аня К. · Модель — Саша · MUAH — Лера)" value={shootTeam} onChange={e => setShootTeam(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit', resize: 'vertical' }} />
             
             <div style={{ border: '1px dashed var(--ink)', padding: '24px', textAlign: 'center', background: 'var(--paper-2)' }}>
                <input type="file" multiple accept="image/*" onChange={(e) => setShootFiles(Array.from(e.target.files || []))} style={{ width: '100%' }} />
@@ -2073,8 +2101,8 @@ button{font-family:inherit}
 .drawer-admin:hover{color:#F4F2EF}
 
 /* ── hero ── */
-.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center;padding:52px 24px 64px}
-@media (min-width:900px){.hero{padding:64px 56px 84px}}
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:start;padding:40px 24px 64px}
+@media (min-width:900px){.hero{padding:44px 56px 84px}}
 .hero-l{display:flex;flex-direction:column}
 .hero-l h1{margin:0}
 .hero-over{font-family:'Archivo',sans-serif;font-weight:800;text-transform:lowercase;letter-spacing:-.03em;color:rgba(11,11,10,.10);font-size:clamp(26px,4.4vw,58px);line-height:.9;margin-bottom:-1.4vw}
@@ -2160,6 +2188,13 @@ button{font-family:inherit}
 /* ── тест-ретушь ── */
 .testgrid{display:grid;grid-template-columns:.85fr 1.15fr;gap:52px;align-items:start}
 .steps{border-top:1px solid var(--line)}
+/* белая карточка формы внутри чёрной секции: переопределяем переменные обратно на светлые */
+.testform{background:#F4F2EF;color:#0B0B0A;padding:30px 28px 32px;--ink:#0B0B0A;--paper:#F4F2EF;--paper-2:#EAE7E2;--line:#D6D2CB;--line-soft:#E2DFD9;--mute:#7C776E;--accent:#A79E90}
+.testform ::placeholder{color:#9A958C}
+.testform select option{background:#F4F2EF;color:#0B0B0A}
+@media (max-width:760px){.testform{padding:22px 18px 24px}}
+.shoot-t{min-width:0}
+.shoot-team{margin-top:8px;font-size:12px;line-height:1.6;color:var(--mute);max-width:80ch}
 .step{display:flex;gap:16px;padding:20px 0;border-bottom:1px solid var(--line-soft)}
 .step:last-child{border-bottom:0}
 .step-t{font-family:'Archivo',sans-serif;font-weight:600;font-size:16px;letter-spacing:-.01em}
