@@ -168,21 +168,54 @@ app.post('/api/smart-search', async (req, res) => {
         console.log(`[🚀 ШАГ 1] Ищем профили, похожие на: ${refProfilesArray.join(', ')}...`);
 
         const candidateUsernames = new Set();
-        try {
-            const runSimilar = await runActorSafe("thenetaji/instagram-related-user-scraper", {
-                username: refProfilesArray,
-                type: "similar_users",
-                profileEnriched: false,
-                maxItem: 80
-            }, 180);
-            const similarItems = await getDatasetItemsSafe(runSimilar.defaultDatasetId, 'похожие профили');
-            similarItems.forEach(it => {
-                const uname = it.username || it.inputs;
-                if (uname) candidateUsernames.add(uname);
+
+        // Ищем похожие профили. Основной актор — memo23; у thenetaji исчерпан бесплатный лимит
+        // в 100 результатов (запуск завершается успешно, но датасет пустой), поэтому он теперь запасной.
+        const SIMILAR_SOURCES = [
+            {
+                actor: "memo23/instagram-similar-profiles-scraper",
+                input: {
+                    usernames: refProfilesArray,
+                    maxSimilarPerAccount: 30,
+                    enrichProfiles: false,
+                    depth: 1,
+                    maxTotalProfiles: 80
+                }
+            },
+            {
+                actor: "thenetaji/instagram-related-user-scraper",
+                input: {
+                    username: refProfilesArray,
+                    enrichProfile: false,
+                    maxItem: 80
+                }
+            }
+        ];
+
+        for (const src of SIMILAR_SOURCES) {
+            try {
+                const runSimilar = await runActorSafe(src.actor, src.input, 240);
+                const similarItems = await getDatasetItemsSafe(runSimilar.defaultDatasetId, 'похожие профили');
+                similarItems.forEach(it => {
+                    const uname = it.username || it.inputs;
+                    // исключаем сами профили-примеры: они и так есть у неё
+                    if (uname && !refProfilesArray.some(r => r.toLowerCase() === String(uname).toLowerCase())) {
+                        candidateUsernames.add(uname);
+                    }
+                });
+                console.log(`[🚀 ШАГ 1] ${src.actor}: похожих профилей ${candidateUsernames.size}`);
+                if (candidateUsernames.size > 0) break;
+                console.log(`[!] ${src.actor} вернул пустой список — возможно, исчерпан бесплатный лимит актора. Пробую следующий источник.`);
+            } catch (e) {
+                console.log(`[!] ${src.actor} не ответил: ${e.message}`);
+            }
+        }
+
+        if (candidateUsernames.size === 0) {
+            return res.json({
+                success: false,
+                error: "Сервисы поиска похожих профилей вернули пустой список. Обычно это исчерпанный бесплатный лимит актора в Apify: открой Apify → Billing и посмотри остаток, либо смени актор поиска."
             });
-            console.log(`[🚀 ШАГ 1] Найдено похожих профилей: ${candidateUsernames.size}`);
-        } catch (e) {
-            console.log('Не удалось получить похожие профили:', e.message);
         }
 
         const allUsernames = [...candidateUsernames];
