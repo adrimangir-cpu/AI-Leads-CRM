@@ -30,10 +30,38 @@ initializeApp({
 });
 const db = getFirestore();
 
+// Провайдер ИИ переключается переменной AI_PROVIDER в .env: proxyapi | openai | gemini.
+// proxyapi — как было раньше (нужен баланс на api.proxyapi.ru);
+// openai — напрямую в OpenAI по ключу sk-... ;
+// gemini — Google AI Studio, есть бесплатный тариф, тоже умеет смотреть фото.
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'proxyapi').toLowerCase();
+const AI_PROVIDERS = {
+    proxyapi: { baseURL: "https://api.proxyapi.ru/openai/v1", key: 'OPENAI_API_KEY', model: "gpt-4o" },
+    openai:   { baseURL: undefined,                            key: 'OPENAI_API_KEY', model: "gpt-4o" },
+    gemini:   { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", key: 'GEMINI_API_KEY', model: "gemini-2.5-flash" }
+};
+const AI_CONF = AI_PROVIDERS[AI_PROVIDER] || AI_PROVIDERS.proxyapi;
+const AI_MODEL = process.env.AI_MODEL || AI_CONF.model;
+
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY, 
-    baseURL: "https://api.proxyapi.ru/openai/v1",
+    apiKey: process.env[AI_CONF.key],
+    baseURL: AI_CONF.baseURL,
 });
+console.log(`[⚙] ИИ: провайдер ${AI_PROVIDER}, модель ${AI_MODEL}${process.env[AI_CONF.key] ? '' : ' — ВНИМАНИЕ: ключ ' + AI_CONF.key + ' не найден в .env'}`);
+
+// Превращает техническую ошибку ИИ в понятную фразу для интерфейса
+function aiErrorText(err) {
+    const msg = err?.message || 'неизвестная ошибка';
+    if (/insufficient balance|insufficient_quota|402/i.test(msg)) {
+        return AI_PROVIDER === 'proxyapi'
+            ? 'Закончился баланс на api.proxyapi.ru — пополни счёт или переключи AI_PROVIDER на gemini в файле .env'
+            : `У провайдера ${AI_PROVIDER} закончился баланс или квота — пополни счёт либо смени AI_PROVIDER в .env`;
+    }
+    if (/401|invalid api key|api key not valid/i.test(msg)) return `Провайдер ${AI_PROVIDER} не принял ключ — проверь ${AI_CONF.key} в .env`;
+    if (/429|rate limit|quota/i.test(msg)) return `Провайдер ${AI_PROVIDER} просит подождать: превышен лимит запросов в минуту`;
+    if (/model|not found|404/i.test(msg)) return `Модель ${AI_MODEL} недоступна у провайдера ${AI_PROVIDER} — поправь AI_MODEL в .env`;
+    return `Сбой ИИ: ${msg}`;
+}
 
 const apifyClient = new ApifyClient({
     token: process.env.APIFY_TOKEN,     
@@ -132,7 +160,7 @@ app.post('/api/analyze', async (req, res) => {
 
         const completion = await openai.chat.completions.create({
             messages: [{ role: "user", content: prompt }],
-            model: "gpt-4o",
+            model: AI_MODEL,
         });
 
         const aiResponse = completion.choices[0].message.content;
@@ -381,7 +409,7 @@ ${antiPatternText}${referenceBlock}
                         for (let attempt = 1; attempt <= 3; attempt++) {
                             try {
                                 completion = await openai.chat.completions.create({
-                                    model: "gpt-4o",
+                                    model: AI_MODEL,
                                     response_format: { type: "json_object" },
                                     messages: [{ role: "user", content: contentBlocks }]
                                 });
@@ -396,11 +424,11 @@ ${antiPatternText}${referenceBlock}
                         if (completion) {
                             aiResult = JSON.parse(completion.choices[0].message.content.trim());
                         } else {
-                            aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: `Сбой API нейросети: ${lastAiErr?.message || 'неизвестная ошибка'}` };
+                            aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: aiErrorText(lastAiErr) };
                         }
                     } catch (aiErr) {
                         console.log(`[!] Неожиданная ошибка при оценке @${username}: ${aiErr.message}`);
-                        aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: `Сбой: ${aiErr.message}` };
+                        aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: aiErrorText(aiErr) };
                     }
                 }
 
