@@ -204,10 +204,12 @@ app.post('/api/smart-search', async (req, res) => {
                 actor: "memo23/instagram-similar-profiles-scraper",
                 input: {
                     usernames: refProfilesArray,
-                    maxSimilarPerAccount: 30,
+                    maxSimilarPerAccount: 40,
                     enrichProfiles: false,
-                    depth: 1,
-                    maxTotalProfiles: 80
+                    // глубина 2: берём и похожих на похожих — иначе пул слишком мал и после отсева
+                    // журналов и пабликов остаётся всего несколько живых фотографов
+                    depth: 2,
+                    maxTotalProfiles: 120
                 }
             },
             {
@@ -345,8 +347,21 @@ app.post('/api/smart-search', async (req, res) => {
 
                 const excludedRoleRegex = /(retouch|ретуш|editor|make[\s-]?up|\bmua\b|визажист|визаж|мейкап|hair\s?stylist|hairstylist|magazine|vogue|bazaar|elle|agency|publication|journal|mag\b)/i;
 
-                if (excludedRoleRegex.test(bio)) {
-                    aiResult = { status: "🔴 МУСОР", matchScore: 0, direction: "Не целевой профиль", opinion: "Авто-отсев (Журнал, агентство или ретушер)." };
+                // Паблики и подборки чужих работ: в шапке зовут присылать кадры или отмечать аккаунт.
+                // Раньше они проходили фильтр, потому что слова "magazine" в шапке у них нет.
+                const aggregatorRegex = /(submission|submit your|send us|dm (us )?(for|to) (feature|share)|tag us|use #|hashtag|feature your|we feature|curat|community|daily (dose|inspo|feed)|inspo|showcase|best of|selection of|repost|credit to|all rights to|photo(graphy)? (page|account|archive)|архив|подборк)/i;
+
+                // У бизнес-аккаунтов Instagram сам хранит категорию — журналы и медиа видно по ней
+                const category = `${profile.businessCategoryName || ''} ${profile.categoryName || ''} ${profile.categoryEnum || ''}`;
+                const excludedCategoryRegex = /(magazine|media|news|publisher|blog|community|arts? ?& ?entertainment|clothing|brand|retail|shopping|model|agency)/i;
+
+                let autoRejectReason = null;
+                if (excludedRoleRegex.test(bio)) autoRejectReason = 'Авто-отсев: журнал, агентство, ретушёр или визажист.';
+                else if (aggregatorRegex.test(bio)) autoRejectReason = 'Авто-отсев: паблик-подборка чужих работ, а не снимающий фотограф.';
+                else if (category.trim() && excludedCategoryRegex.test(category)) autoRejectReason = `Авто-отсев по категории аккаунта: ${category.trim()}.`;
+
+                if (autoRejectReason) {
+                    aiResult = { status: "🔴 МУСОР", matchScore: 0, direction: "Не целевой профиль", opinion: autoRejectReason };
                 } else {
                     for (const url of photoUrlsToDownload) {
                         const dataUri = await downloadImageAsDataUri(url);
@@ -367,6 +382,8 @@ ${antiPatternText}${referenceBlock}
 1. Сначала оцени ДОЛЮ фото кандидата, которая реально попадает в тематику и ТЗ и близка к эталонам — а не просто "тоже фотография людей". Если доля меньше 70% — это МУСОР, независимо от красоты отдельных кадров.
 2. Затем — техническое качество: свет (студийный/плоский "в лоб"), сохранена ли текстура кожи или "пластик", композиция.
 3. 🔴 "МУСОР" — доля жанра < 70%, ИЛИ качество явно ниже эталонов, ИЛИ это модель/визажист/журнал/предметник/свадебщик.
+3а. ОБЯЗАТЕЛЬНО отсеивай аккаунты, которые НЕ СНИМАЮТ САМИ: журналы, медиа, паблики-подборки, архивы вдохновения, агентства, бренды одежды, магазины. Признаки: в ленте работы разных авторов с разным почерком и обработкой, кадры подписаны чужими именами или отметками, в шапке просят присылать работы или отмечать аккаунт, лента выглядит как витрина чужого творчества. Такому кандидату ставь matchScore 0 и в opinion прямо пиши, что это не снимающий фотограф.
+3б. Нам нужен ЧЕЛОВЕК ИЛИ СТУДИЯ, снимающая сама: узнаваемый единый почерк, повторяющиеся модели и локации, съёмки одной серии.
 4. 🟡 "ПОТЕНЦИАЛ" — доля жанра ≥ 70%, но качество или консистентность заметно уступают эталонам.
 5. 🟢 "ПРОФИ" — доля жанра ~100%, качество и стиль на уровне эталонов или выше.
 
