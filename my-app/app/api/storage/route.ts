@@ -1,6 +1,6 @@
 /* ──────────────────────────────────────────────────────────────────────────
-   Облачное хранилище съёмок: my-app/app/api/storage/route.ts
-   Адаптировано для Yandex Cloud Object Storage
+   Облачное хранилище: my-app/app/api/storage/route.ts
+   Yandex Cloud Object Storage + генерация ссылок для предпросмотра
    ────────────────────────────────────────────────────────────────────────── */
 
 export const runtime = 'edge';
@@ -18,7 +18,9 @@ const SERVICE = 's3';
 const enc = new TextEncoder();
 
 function hex(buf: ArrayBuffer): string {
-  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 async function sha256Hex(data: string): Promise<string> {
@@ -26,7 +28,13 @@ async function sha256Hex(data: string): Promise<string> {
 }
 
 async function hmac(key: ArrayBuffer | Uint8Array, data: string): Promise<ArrayBuffer> {
-  const cryptoKey = await crypto.subtle.importKey('raw', key as BufferSource, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    key as BufferSource,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
   return crypto.subtle.sign('HMAC', cryptoKey, enc.encode(data));
 }
 
@@ -150,7 +158,16 @@ export async function GET(req: Request) {
   if (!r.ok) return json({ error: `Yandex ответил ${r.status}. ${xml.slice(0, 200)}` }, 502);
 
   const { folders, files, truncated } = parseList(xml);
-  return json({ prefix, folders, files, truncated });
+
+  // Генерируем ссылку предпросмотра для каждого файла
+  const filesWithUrls = await Promise.all(
+    files.map(async (f) => ({
+      ...f,
+      url: await presign('GET', f.key, { expires: 7200 }),
+    }))
+  );
+
+  return json({ prefix, folders, files: filesWithUrls, truncated });
 }
 
 export async function POST(req: Request) {
@@ -160,7 +177,11 @@ export async function POST(req: Request) {
   if (deny) return json({ error: deny }, 401);
 
   let body: { action?: string; key?: string; name?: string } = {};
-  try { body = await req.json(); } catch { return json({ error: 'Некорректный запрос' }, 400); }
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: 'Некорректный запрос' }, 400);
+  }
 
   const action = body.action || '';
   const key = (body.key || '').replace(/^\/+/, '');
@@ -202,4 +223,3 @@ export async function POST(req: Request) {
 
   return json({ error: 'Неизвестное действие' }, 400);
 }
-

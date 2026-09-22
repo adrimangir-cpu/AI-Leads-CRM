@@ -2109,11 +2109,29 @@ export default function Home() {
                   .map(file => {
                     const name = file.key.split('/').pop();
                     const date = file.modified ? new Date(file.modified).toLocaleDateString('ru-RU') : '';
+                    const isImage = /\.(jpe?g|png|webp|gif|heic|avif)$/i.test(name);
+
                     return (
                       <div key={file.key} className="st-row">
-                        <div className="st-name">
-                          <span className="st-title">{name}</span>
-                          <span className="st-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
+                        <div className="st-name" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '14px', minWidth: 0 }}>
+                          {isImage && file.url ? (
+                            <div
+                              style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 4, overflow: 'hidden', cursor: 'zoom-in', border: '1px solid var(--line-soft)' }}
+                              onClick={() => window.open(file.url, '_blank')}
+                              title="Открыть в полном размере"
+                            >
+                              <img src={file.url} alt={name} loading="lazy" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            </div>
+                          ) : (
+                            <div style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 4, background: 'var(--paper-2)', border: '1px solid var(--line-soft)', display: 'grid', placeItems: 'center' }}>
+                              <span style={{ fontSize: '10px', color: 'var(--mute)', fontFamily: 'Archivo', textTransform: 'uppercase' }}>File</span>
+                            </div>
+                          )}
+
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
+                            <span className="st-title" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+                            <span className="st-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
+                          </div>
                         </div>
                         <div className="st-actions">
                           <button className="st-btn" disabled={stBusyKey === file.key} onClick={() => handleStorageDownload(file)}>
