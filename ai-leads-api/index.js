@@ -30,10 +30,38 @@ initializeApp({
 });
 const db = getFirestore();
 
+// Провайдер ИИ переключается переменной AI_PROVIDER в .env: proxyapi | openai | gemini.
+// proxyapi — как было раньше (нужен баланс на api.proxyapi.ru);
+// openai — напрямую в OpenAI по ключу sk-... ;
+// gemini — Google AI Studio, есть бесплатный тариф, тоже умеет смотреть фото.
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'proxyapi').toLowerCase();
+const AI_PROVIDERS = {
+    proxyapi: { baseURL: "https://api.proxyapi.ru/openai/v1", key: 'OPENAI_API_KEY', model: "gpt-4o" },
+    openai:   { baseURL: undefined,                            key: 'OPENAI_API_KEY', model: "gpt-4o" },
+    gemini:   { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", key: 'GEMINI_API_KEY', model: "gemini-2.5-flash" }
+};
+const AI_CONF = AI_PROVIDERS[AI_PROVIDER] || AI_PROVIDERS.proxyapi;
+const AI_MODEL = process.env.AI_MODEL || AI_CONF.model;
+
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY, 
-    baseURL: "https://api.proxyapi.ru/openai/v1",
+    apiKey: process.env[AI_CONF.key],
+    baseURL: AI_CONF.baseURL,
 });
+console.log(`[⚙] ИИ: провайдер ${AI_PROVIDER}, модель ${AI_MODEL}${process.env[AI_CONF.key] ? '' : ' — ВНИМАНИЕ: ключ ' + AI_CONF.key + ' не найден в .env'}`);
+
+// Превращает техническую ошибку ИИ в понятную фразу для интерфейса
+function aiErrorText(err) {
+    const msg = err?.message || 'неизвестная ошибка';
+    if (/insufficient balance|insufficient_quota|402/i.test(msg)) {
+        return AI_PROVIDER === 'proxyapi'
+            ? 'Закончился баланс на api.proxyapi.ru — пополни счёт или переключи AI_PROVIDER на gemini в файле .env'
+            : `У провайдера ${AI_PROVIDER} закончился баланс или квота — пополни счёт либо смени AI_PROVIDER в .env`;
+    }
+    if (/401|invalid api key|api key not valid/i.test(msg)) return `Провайдер ${AI_PROVIDER} не принял ключ — проверь ${AI_CONF.key} в .env`;
+    if (/429|rate limit|quota/i.test(msg)) return `Провайдер ${AI_PROVIDER} просит подождать: превышен лимит запросов в минуту`;
+    if (/model|not found|404/i.test(msg)) return `Модель ${AI_MODEL} недоступна у провайдера ${AI_PROVIDER} — поправь AI_MODEL в .env`;
+    return `Сбой ИИ: ${msg}`;
+}
 
 const apifyClient = new ApifyClient({
     token: process.env.APIFY_TOKEN,     
@@ -132,7 +160,7 @@ app.post('/api/analyze', async (req, res) => {
 
         const completion = await openai.chat.completions.create({
             messages: [{ role: "user", content: prompt }],
-            model: "gpt-4o",
+            model: AI_MODEL,
         });
 
         const aiResponse = completion.choices[0].message.content;
@@ -168,21 +196,56 @@ app.post('/api/smart-search', async (req, res) => {
         console.log(`[🚀 ШАГ 1] Ищем профили, похожие на: ${refProfilesArray.join(', ')}...`);
 
         const candidateUsernames = new Set();
-        try {
-            const runSimilar = await runActorSafe("thenetaji/instagram-related-user-scraper", {
-                username: refProfilesArray,
-                type: "similar_users",
-                profileEnriched: false,
-                maxItem: 80
-            }, 180);
-            const similarItems = await getDatasetItemsSafe(runSimilar.defaultDatasetId, 'похожие профили');
-            similarItems.forEach(it => {
-                const uname = it.username || it.inputs;
-                if (uname) candidateUsernames.add(uname);
+
+        // Ищем похожие профили. Основной актор — memo23; у thenetaji исчерпан бесплатный лимит
+        // в 100 результатов (запуск завершается успешно, но датасет пустой), поэтому он теперь запасной.
+        const SIMILAR_SOURCES = [
+            {
+                actor: "memo23/instagram-similar-profiles-scraper",
+                input: {
+                    usernames: refProfilesArray,
+                    maxSimilarPerAccount: 40,
+                    enrichProfiles: false,
+                    // глубина 2: берём и похожих на похожих — иначе пул слишком мал и после отсева
+                    // журналов и пабликов остаётся всего несколько живых фотографов
+                    depth: 2,
+                    maxTotalProfiles: 120
+                }
+            },
+            {
+                actor: "thenetaji/instagram-related-user-scraper",
+                input: {
+                    username: refProfilesArray,
+                    enrichProfile: false,
+                    maxItem: 80
+                }
+            }
+        ];
+
+        for (const src of SIMILAR_SOURCES) {
+            try {
+                const runSimilar = await runActorSafe(src.actor, src.input, 240);
+                const similarItems = await getDatasetItemsSafe(runSimilar.defaultDatasetId, 'похожие профили');
+                similarItems.forEach(it => {
+                    const uname = it.username || it.inputs;
+                    // исключаем сами профили-примеры: они и так есть у неё
+                    if (uname && !refProfilesArray.some(r => r.toLowerCase() === String(uname).toLowerCase())) {
+                        candidateUsernames.add(uname);
+                    }
+                });
+                console.log(`[🚀 ШАГ 1] ${src.actor}: похожих профилей ${candidateUsernames.size}`);
+                if (candidateUsernames.size > 0) break;
+                console.log(`[!] ${src.actor} вернул пустой список — возможно, исчерпан бесплатный лимит актора. Пробую следующий источник.`);
+            } catch (e) {
+                console.log(`[!] ${src.actor} не ответил: ${e.message}`);
+            }
+        }
+
+        if (candidateUsernames.size === 0) {
+            return res.json({
+                success: false,
+                error: "Сервисы поиска похожих профилей вернули пустой список. Обычно это исчерпанный бесплатный лимит актора в Apify: открой Apify → Billing и посмотри остаток, либо смени актор поиска."
             });
-            console.log(`[🚀 ШАГ 1] Найдено похожих профилей: ${candidateUsernames.size}`);
-        } catch (e) {
-            console.log('Не удалось получить похожие профили:', e.message);
         }
 
         const allUsernames = [...candidateUsernames];
@@ -284,8 +347,21 @@ app.post('/api/smart-search', async (req, res) => {
 
                 const excludedRoleRegex = /(retouch|ретуш|editor|make[\s-]?up|\bmua\b|визажист|визаж|мейкап|hair\s?stylist|hairstylist|magazine|vogue|bazaar|elle|agency|publication|journal|mag\b)/i;
 
-                if (excludedRoleRegex.test(bio)) {
-                    aiResult = { status: "🔴 МУСОР", matchScore: 0, direction: "Не целевой профиль", opinion: "Авто-отсев (Журнал, агентство или ретушер)." };
+                // Паблики и подборки чужих работ: в шапке зовут присылать кадры или отмечать аккаунт.
+                // Раньше они проходили фильтр, потому что слова "magazine" в шапке у них нет.
+                const aggregatorRegex = /(submission|submit your|send us|dm (us )?(for|to) (feature|share)|tag us|use #|hashtag|feature your|we feature|curat|community|daily (dose|inspo|feed)|inspo|showcase|best of|selection of|repost|credit to|all rights to|photo(graphy)? (page|account|archive)|архив|подборк)/i;
+
+                // У бизнес-аккаунтов Instagram сам хранит категорию — журналы и медиа видно по ней
+                const category = `${profile.businessCategoryName || ''} ${profile.categoryName || ''} ${profile.categoryEnum || ''}`;
+                const excludedCategoryRegex = /(magazine|media|news|publisher|blog|community|arts? ?& ?entertainment|clothing|brand|retail|shopping|model|agency)/i;
+
+                let autoRejectReason = null;
+                if (excludedRoleRegex.test(bio)) autoRejectReason = 'Авто-отсев: журнал, агентство, ретушёр или визажист.';
+                else if (aggregatorRegex.test(bio)) autoRejectReason = 'Авто-отсев: паблик-подборка чужих работ, а не снимающий фотограф.';
+                else if (category.trim() && excludedCategoryRegex.test(category)) autoRejectReason = `Авто-отсев по категории аккаунта: ${category.trim()}.`;
+
+                if (autoRejectReason) {
+                    aiResult = { status: "🔴 МУСОР", matchScore: 0, direction: "Не целевой профиль", opinion: autoRejectReason };
                 } else {
                     for (const url of photoUrlsToDownload) {
                         const dataUri = await downloadImageAsDataUri(url);
@@ -306,6 +382,8 @@ ${antiPatternText}${referenceBlock}
 1. Сначала оцени ДОЛЮ фото кандидата, которая реально попадает в тематику и ТЗ и близка к эталонам — а не просто "тоже фотография людей". Если доля меньше 70% — это МУСОР, независимо от красоты отдельных кадров.
 2. Затем — техническое качество: свет (студийный/плоский "в лоб"), сохранена ли текстура кожи или "пластик", композиция.
 3. 🔴 "МУСОР" — доля жанра < 70%, ИЛИ качество явно ниже эталонов, ИЛИ это модель/визажист/журнал/предметник/свадебщик.
+3а. ОБЯЗАТЕЛЬНО отсеивай аккаунты, которые НЕ СНИМАЮТ САМИ: журналы, медиа, паблики-подборки, архивы вдохновения, агентства, бренды одежды, магазины. Признаки: в ленте работы разных авторов с разным почерком и обработкой, кадры подписаны чужими именами или отметками, в шапке просят присылать работы или отмечать аккаунт, лента выглядит как витрина чужого творчества. Такому кандидату ставь matchScore 0 и в opinion прямо пиши, что это не снимающий фотограф.
+3б. Нам нужен ЧЕЛОВЕК ИЛИ СТУДИЯ, снимающая сама: узнаваемый единый почерк, повторяющиеся модели и локации, съёмки одной серии.
 4. 🟡 "ПОТЕНЦИАЛ" — доля жанра ≥ 70%, но качество или консистентность заметно уступают эталонам.
 5. 🟢 "ПРОФИ" — доля жанра ~100%, качество и стиль на уровне эталонов или выше.
 
@@ -348,7 +426,7 @@ ${antiPatternText}${referenceBlock}
                         for (let attempt = 1; attempt <= 3; attempt++) {
                             try {
                                 completion = await openai.chat.completions.create({
-                                    model: "gpt-4o",
+                                    model: AI_MODEL,
                                     response_format: { type: "json_object" },
                                     messages: [{ role: "user", content: contentBlocks }]
                                 });
@@ -363,11 +441,11 @@ ${antiPatternText}${referenceBlock}
                         if (completion) {
                             aiResult = JSON.parse(completion.choices[0].message.content.trim());
                         } else {
-                            aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: `Сбой API нейросети: ${lastAiErr?.message || 'неизвестная ошибка'}` };
+                            aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: aiErrorText(lastAiErr) };
                         }
                     } catch (aiErr) {
                         console.log(`[!] Неожиданная ошибка при оценке @${username}: ${aiErr.message}`);
-                        aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: `Сбой: ${aiErr.message}` };
+                        aiResult = { status: "⚪ СБОЙ ИИ", matchScore: 0, direction: "-", opinion: aiErrorText(aiErr) };
                     }
                 }
 

@@ -17,8 +17,7 @@
 
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, setDoc, query, orderBy } from 'firebase/firestore';
-import { db, auth, storage } from '../firebase';
-import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { db, auth } from '../firebase';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 
 const TABS = [
@@ -27,6 +26,7 @@ const TABS = [
   { id: 'portfolio', num: '03', label: 'Сайт и портфолио' },
   { id: 'orders', num: '04', label: 'Учет заказов' },
   { id: 'mail', num: '05', label: 'Рассылка' },
+  { id: 'files', num: '06', label: 'Хранилище' },
 ];
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:5000';
@@ -70,22 +70,23 @@ function rowsFor(n) {
   }
   return r;
 }
-const W = { 1: [1], 2: [[1.32, 1], [1, 1.32]], 3: [[1, 1.24, 1], [1.24, 1, 1.1]] };
-const H = { 1: ['100%'], 2: [['100%', '87%'], ['88%', '100%']], 3: [['93%', '100%', '85%'], ['100%', '86%', '96%']] };
-const ROWH = { 1: 'clamp(400px,46vw,600px)', 2: 'clamp(300px,32vw,500px)', 3: 'clamp(230px,23vw,370px)' };
+/* Пропорция кадра. Раньше ряды имели жёсткую высоту, а кадры внутри обрезались
+   по object-fit:cover — поэтому на разных экранах у горизонтальных фото срезало края.
+   Теперь каждая ячейка получает пропорцию самого кадра, и обрезки нет вообще. */
+const AR_MIN = 0.42, AR_MAX = 2.4;
+function photoAr(p) {
+  const w = Number(p && p.w) || 0, h = Number(p && p.h) || 0;
+  if (w > 0 && h > 0) return Math.min(AR_MAX, Math.max(AR_MIN, w / h));
+  return 0.75; // старые кадры без сохранённых размеров: вертикаль 3/4, уточним после загрузки
+}
 
 function buildRows(photos) {
   if (!photos || photos.length === 0) return [];
   const sizes = rowsFor(photos.length);
   const out = []; let i = 0;
-  sizes.forEach((size, ri) => {
-    const items = photos.slice(i, i + size).map((p, k) => ({
-      photo: p,
-      idx: i + k,
-      flex: size === 1 ? 1 : W[size][ri % 2][k],
-      h: size === 1 ? '100%' : H[size][ri % 2][k],
-    }));
-    out.push({ size, h: ROWH[size], items, single: size === 1 });
+  sizes.forEach((size) => {
+    const items = photos.slice(i, i + size).map((p, k) => ({ photo: p, idx: i + k, ar: photoAr(p) }));
+    out.push({ size, items, single: size === 1 });
     i += size;
   });
   return out;
@@ -118,74 +119,55 @@ async function loadBitmap(file) {
   }
 }
 
-/* Загрузка в Storage.
-   Сначала пробуем возобновляемый режим — он даёт процент. Если за 8 секунд
-   не ушло ни одного байта (частая причина: в CORS хранилища не разрешены
-   служебные заголовки x-goog-upload-*), молча переключаемся на простую
-   загрузку одним куском со своим таймаутом. Так процент есть там, где он
-   возможен, а загрузка не зависает там, где нет. */
-function withTimeout(promise, ms, message) {
-  let timer;
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
-  ]);
+/* Хранилище фотографий — Cloudinary.
+   Загрузка идёт «неподписанным» способом (unsigned upload preset), поэтому
+   в коде нет ни одного секрета: нужны только два публичных значения —
+   имя облака и имя preset. Они лежат в site_settings/public и задаются
+   в дашборде, в блоке «Хранилище фотографий». XMLHttpRequest выбран
+   вместо fetch ради честного процента загрузки. */
+function storageConfig(settings) {
+  return {
+    cloud: (settings && settings.cloudName) || process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD || '',
+    preset: (settings && settings.uploadPreset) || process.env.NEXT_PUBLIC_CLOUDINARY_PRESET || '',
+  };
 }
 
-function tryResumable(fileRef, blob, onProgress) {
+function uploadImage(blob, folder, cfg, onProgress) {
   return new Promise((resolve, reject) => {
-    let task;
-    try {
-      task = uploadBytesResumable(fileRef, blob, { contentType: 'image/jpeg' });
-    } catch (e) { reject(new Error('RESUMABLE_UNAVAILABLE')); return; }
-    let moved = false;
-    let last = Date.now();
-    const stop = setInterval(() => {
-      const idle = Date.now() - last;
-      if (!moved && idle > 8000) {
-        clearInterval(stop);
-        try { task.cancel(); } catch (e) { /* уже завершилась */ }
-        reject(new Error('RESUMABLE_STALLED'));
-      } else if (moved && idle > 45000) {
-        clearInterval(stop);
-        try { task.cancel(); } catch (e) { /* уже завершилась */ }
-        reject(new Error('связь пропала на середине загрузки — попробуй ещё раз, лучше по Wi-Fi'));
-      }
-    }, 2000);
-    task.on('state_changed',
-      (snap) => {
-        last = Date.now();
-        if (snap.bytesTransferred > 0) moved = true;
-        if (onProgress && snap.totalBytes) onProgress(Math.round((snap.bytesTransferred / snap.totalBytes) * 100));
-      },
-      (err) => {
-        clearInterval(stop);
-        const code = err && err.code ? String(err.code) : '';
-        if (!moved && /retry-limit|unknown|canceled/.test(code)) reject(new Error('RESUMABLE_STALLED'));
-        else if (/unauthorized|unauthenticated/.test(code)) reject(new Error('хранилище не разрешает запись (правила Storage) — ' + code));
-        else reject(new Error(code || err.message || 'хранилище не приняло файл'));
-      },
-      () => { clearInterval(stop); if (onProgress) onProgress(100); resolve('resumable'); }
-    );
-  });
-}
+    if (!cfg || !cfg.cloud || !cfg.preset) {
+      reject(new Error('не заданы имя облака и upload preset — впиши их в блоке «Хранилище фотографий» и сохрани'));
+      return;
+    }
+    const form = new FormData();
+    form.append('file', blob);
+    form.append('upload_preset', cfg.preset);
+    if (folder) form.append('folder', folder);
 
-async function uploadWithProgress(fileRef, blob, onProgress) {
-  try {
-    return await tryResumable(fileRef, blob, onProgress);
-  } catch (e) {
-    const m = e && e.message ? e.message : '';
-    if (m !== 'RESUMABLE_STALLED' && m !== 'RESUMABLE_UNAVAILABLE') throw e;
-  }
-  // запасной путь: простая загрузка, без процента, но со своим таймаутом
-  if (onProgress) onProgress(-1);
-  await withTimeout(
-    uploadBytes(fileRef, blob, { contentType: 'image/jpeg' }),
-    150000,
-    'файл не загрузился за 2,5 минуты — проверь связь и попробуй по Wi-Fi'
-  );
-  if (onProgress) onProgress(100);
-  return 'simple';
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `https://api.cloudinary.com/v1_1/${cfg.cloud}/image/upload`);
+    xhr.timeout = 180000;
+    if (xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (onProgress && e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+      };
+    }
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* пустой ответ */ }
+      if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
+        if (onProgress) onProgress(100);
+        resolve({ url: data.secure_url, w: data.width || 0, h: data.height || 0, path: data.public_id || '' });
+        return;
+      }
+      const msg = (data.error && data.error.message) || ('код ' + xhr.status);
+      if (/preset/i.test(msg)) reject(new Error('Cloudinary не принял preset («' + msg + '») — проверь имя и что режим стоит Unsigned'));
+      else if (/unknown api key|invalid cloud/i.test(msg) || xhr.status === 404) reject(new Error('Cloudinary не узнал облако «' + cfg.cloud + '» — проверь Cloud name на главной странице аккаунта'));
+      else reject(new Error('Cloudinary отклонил загрузку: ' + msg));
+    };
+    xhr.onerror = () => reject(new Error('запрос не дошёл до Cloudinary — проверь Cloud name и соединение'));
+    xhr.ontimeout = () => reject(new Error('файл не загрузился за 3 минуты — попробуй ещё раз'));
+    xhr.send(form);
+  });
 }
 
 async function compressImage(file, maxSide = 1600, quality = 0.82) {
@@ -434,6 +416,14 @@ function PublicSite({ onAdminClick }) {
   const [settings, setSettings] = useState(null);
   const [cat, setCat] = useState(CATEGORIES[0].id);
   const [lb, setLb] = useState({ list: [], idx: null });
+  // пропорции кадров, измеренные прямо из файлов — нужны старым фото без сохранённых размеров
+  const [measuredAr, setMeasuredAr] = useState({});
+  const measure = (url, el) => {
+    const w = el && el.naturalWidth, h = el && el.naturalHeight;
+    if (!w || !h) return;
+    const real = Math.min(AR_MAX, Math.max(AR_MIN, w / h));
+    setMeasuredAr((prev) => (Math.abs((prev[url] || 0) - real) < 0.005 ? prev : { ...prev, [url]: real }));
+  };
   const [loading, setLoading] = useState(true);
   const [scrolled, setScrolled] = useState(false); // ушли ниже первого экрана
   const [menu, setMenu] = useState(false);         // открыто боковое меню
@@ -604,7 +594,6 @@ function PublicSite({ onAdminClick }) {
             <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
             <a href="#work" className="btn ghost">Смотреть работы</a>
           </div>
-          <p className="hero-hint">Первый кадр обрабатываю бесплатно — чтобы ты увидела подход до заказа.</p>
         </div>
         <figure className="hero-img">
           {heroPhoto
@@ -621,7 +610,7 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">01 — about</div>
             <h2 className="display sec-title">обо мне</h2>
           </div>
-          <p className="sec-note">{settings?.aboutNote || 'Шесть лет в цвете и ретуши. Половина работ — коммерческие съёмки, половина — авторские проекты фотографов.'}</p>
+          {settings?.aboutNote ? <p className="sec-note">{settings.aboutNote}</p> : null}
         </div>
         <div className="about">
           {aboutPhoto ? <img src={aboutPhoto} alt="Адриана, ретушёр" /> : <div className="about-empty" />}
@@ -652,7 +641,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">02 — portfolio</div>
             <h2 className="display sec-title">портфолио</h2>
           </div>
-          <p className="sec-note">Выбери категорию — внутри работы собраны по съёмкам, так же как они приходят из студии.</p>
         </div>
 
         <div className="cats" role="tablist">
@@ -675,7 +663,10 @@ function PublicSite({ onAdminClick }) {
         {visible.map((s) => (
           <article className="shoot" key={s.id}>
             <header className="shoot-head">
-              <h3 className="shoot-name">{s.title}</h3>
+              <div className="shoot-t">
+                <h3 className="shoot-name">{s.title}</h3>
+                {s.team ? <div className="shoot-team">{s.team}</div> : null}
+              </div>
               <div className="shoot-meta">
                 <span className="label">{s.photos.length} {plural(s.photos.length)}</span>
                 {s.year && <span className="label">{s.year}</span>}
@@ -683,22 +674,31 @@ function PublicSite({ onAdminClick }) {
             </header>
             <div className="mosaic">
               {buildRows(s.photos).map((row, ri) => (
-                <div className={`mrow ${row.single ? 'single' : ''}`} style={{ height: row.h }} key={ri}>
-                  {row.items.map((it) => (
-                    <figure
-                      key={it.idx}
-                      className="cell"
-                      data-n={String(it.idx + 1).padStart(2, '0')}
-                      style={{
-                        flex: `${it.flex} 1 0`,
-                        height: it.h,
-                        ...(row.single ? { maxWidth: '66%', marginLeft: 'auto', marginRight: 'auto' } : {}),
-                      }}
-                      onClick={() => openLb(s, it.idx)}
-                    >
-                      <img src={it.photo.url} alt={`${s.title} — кадр ${it.idx + 1}`} loading="lazy" />
-                    </figure>
-                  ))}
+                <div className={`mrow ${row.single ? 'single' : ''}`} key={ri}>
+                  {row.items.map((it) => {
+                    // ширина ячейки пропорциональна пропорции кадра, высота считается из неё —
+                    // поэтому кадры в ряду совпадают по высоте, а кропа нет
+                    const ar = measuredAr[it.photo.url] || it.ar;
+                    return (
+                      <figure
+                        key={it.idx}
+                        className="cell"
+                        data-n={String(it.idx + 1).padStart(2, '0')}
+                        style={row.single
+                          ? { aspectRatio: String(ar), width: `min(100%, calc(74vh * ${ar}))`, marginLeft: 'auto', marginRight: 'auto' }
+                          : { flex: `${ar} 1 0`, aspectRatio: String(ar) }}
+                        onClick={() => openLb(s, it.idx)}
+                      >
+                        <img
+                          src={it.photo.url}
+                          alt={`${s.title} — кадр ${it.idx + 1}`}
+                          loading="lazy"
+                          ref={(el) => { if (el && el.complete) measure(it.photo.url, el); }}
+                          onLoad={(e) => measure(it.photo.url, e.currentTarget)}
+                        />
+                      </figure>
+                    );
+                  })}
                 </div>
               ))}
             </div>
@@ -714,7 +714,6 @@ function PublicSite({ onAdminClick }) {
               <div className="sec-num">03 — before / after</div>
               <h2 className="display sec-title">до / после</h2>
             </div>
-            <p className="sec-note">Потяни ползунок. Слева — кадр из камеры, справа — после моей обработки.</p>
           </div>
           <div className="ba-grid">
             {ba.map((item) => <BeforeAfter key={item.id} item={item} />)}
@@ -729,7 +728,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">04 — contact</div>
             <h2 className="display sec-title">связаться</h2>
           </div>
-          <p className="sec-note">Нажми на удобный мессенджер — откроется сразу диалог со мной.</p>
         </div>
         <div className="chgrid">
           {[
@@ -754,7 +752,6 @@ function PublicSite({ onAdminClick }) {
             <div className="sec-num">05 — test</div>
             <h2 className="display sec-title">фото на тест</h2>
           </div>
-          <p className="sec-note">Один кадр — бесплатно. Напиши пару слов, приложи фото, и заявка придёт мне в Telegram.</p>
         </div>
         <div className="testgrid">
           <div className="steps">
@@ -853,7 +850,128 @@ export default function Home() {
   const [shootTitle, setShootTitle] = useState('');
   const [shootCategory, setShootCategory] = useState('beauty');
   const [shootYear, setShootYear] = useState('');
+  const [shootTeam, setShootTeam] = useState('');
   const [shootFiles, setShootFiles] = useState([]);
+  const [teamDraft, setTeamDraft] = useState({});   // id съёмки → текст команды, пока правим
+  const [teamSavedId, setTeamSavedId] = useState('');
+  // ───────── облачное хранилище съёмок (Cloudflare R2 через /api/storage) ─────────
+  const [stPrefix, setStPrefix] = useState('');       // текущая папка
+  const [stFolders, setStFolders] = useState([]);
+  const [stFiles, setStFiles] = useState([]);
+  const [stLoading, setStLoading] = useState(false);
+  const [stError, setStError] = useState('');
+  const [stSearch, setStSearch] = useState('');
+  const [stUploads, setStUploads] = useState([]);     // [{name, percent, error, done}]
+  const [stBusyKey, setStBusyKey] = useState('');
+
+  const humanSize = (n) => {
+    if (!n && n !== 0) return '';
+    if (n < 1024) return n + ' Б';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' КБ';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' МБ';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' ГБ';
+  };
+
+  const stAuthHeader = async () => {
+    const user = auth.currentUser;
+    if (!user) throw new Error('Нужно войти в дашборд заново');
+    const token = await user.getIdToken();
+    return { Authorization: `Bearer ${token}` };
+  };
+
+  const stApi = async (body) => {
+    const headers = { ...(await stAuthHeader()), 'Content-Type': 'application/json' };
+    const r = await fetch('/api/storage', { method: 'POST', headers, body: JSON.stringify(body) });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `Сервер ответил ${r.status}`);
+    return data;
+  };
+
+  const loadStorage = async (prefix = stPrefix) => {
+    setStLoading(true); setStError('');
+    try {
+      const headers = await stAuthHeader();
+      const r = await fetch(`/api/storage?prefix=${encodeURIComponent(prefix)}`, { headers });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `Сервер ответил ${r.status}`);
+      setStFolders(data.folders || []);
+      setStFiles(data.files || []);
+      setStPrefix(prefix);
+    } catch (e) {
+      setStError(e.message);
+      setStFolders([]); setStFiles([]);
+    }
+    setStLoading(false);
+  };
+
+  useEffect(() => {
+    if (activeTab === 'files' && user) loadStorage(stPrefix);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, user]);
+
+  // Файл идёт прямо в Cloudflare по временной ссылке — мимо сайта, поэтому размер не ограничен
+  const uploadOneToStorage = (file, url) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+    xhr.timeout = 6 * 60 * 60 * 1000;
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+      setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, percent } : u)));
+    };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Cloudflare ответил ${xhr.status}`)));
+    xhr.onerror = () => reject(new Error('Обрыв связи. Проверь CORS-правило корзины и интернет'));
+    xhr.ontimeout = () => reject(new Error('Загрузка не уложилась во время'));
+    xhr.send(file);
+  });
+
+  const handleStorageUpload = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    setStUploads(files.map(f => ({ name: f.name, percent: 0 })));
+    for (const file of files) {
+      try {
+        const key = `${stPrefix}${file.name}`;
+        const { url } = await stApi({ action: 'upload-url', key });
+        await uploadOneToStorage(file, url);
+        setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, percent: 100, done: true } : u)));
+      } catch (e) {
+        setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, error: e.message } : u)));
+      }
+    }
+    await loadStorage(stPrefix);
+    setTimeout(() => setStUploads(prev => prev.filter(u => u.error)), 2500);
+  };
+
+  const handleStorageDownload = async (file) => {
+    setStBusyKey(file.key);
+    try {
+      const name = file.key.split('/').pop();
+      const { url } = await stApi({ action: 'download-url', key: file.key, name });
+      window.location.href = url;
+    } catch (e) { setStError(e.message); }
+    setStBusyKey('');
+  };
+
+  const handleStorageDelete = async (file) => {
+    if (!confirm(`Удалить «${file.key.split('/').pop()}» из хранилища? Это необратимо.`)) return;
+    setStBusyKey(file.key);
+    try {
+      await stApi({ action: 'delete', key: file.key });
+      await loadStorage(stPrefix);
+    } catch (e) { setStError(e.message); }
+    setStBusyKey('');
+  };
+
+  const handleStorageNewFolder = async () => {
+    const name = prompt('Название папки (например: 2026-09 Ювелирка Katarzyna)');
+    if (!name || !name.trim()) return;
+    try {
+      await stApi({ action: 'make-folder', key: `${stPrefix}${name.trim()}` });
+      await loadStorage(stPrefix);
+    } catch (e) { setStError(e.message); }
+  };
+
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStep, setUploadStep] = useState('');
 
@@ -872,6 +990,9 @@ export default function Home() {
   const [upPct, setUpPct] = useState(0);
   const [shootBusyId, setShootBusyId] = useState('');
   const [openShootId, setOpenShootId] = useState('');
+  const [cloudName, setCloudName] = useState('');
+  const [uploadPreset, setUploadPreset] = useState('');
+  const storeCfg = storageConfig({ cloudName, uploadPreset });
 
   // Эффект: загрузка входящих заявок
   useEffect(() => {
@@ -913,6 +1034,8 @@ export default function Home() {
       setEditWa(publicSettings.contacts?.whatsapp?.url || '');
       setEditIg(publicSettings.contacts?.instagram?.url || '');
       setEditEmail(publicSettings.contacts?.email?.url?.replace('mailto:', '') || '');
+      setCloudName(publicSettings.cloudName || '');
+      setUploadPreset(publicSettings.uploadPreset || '');
     }
   }, [publicSettings]);
 
@@ -976,6 +1099,8 @@ export default function Home() {
       aboutNote: editAboutNote,
       about: editAbout.split('\n').map(s => s.trim()).filter(Boolean),
       contacts,
+      cloudName: cloudName.trim(),
+      uploadPreset: uploadPreset.trim(),
       facts: publicSettings?.facts || [
         { label: 'Опыт', value: '06', note: 'лет в постобработке' },
         { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
@@ -1000,16 +1125,15 @@ export default function Home() {
       for (let i = 0; i < shootFiles.length; i++) {
         setUploadStep(`${i + 1} / ${shootFiles.length}`);
         const { blob, w, h: hh } = await compressImage(shootFiles[i], 1600, 0.82);
-        const path = `portfolio/${stamp}_${String(i + 1).padStart(2, '0')}.jpg`;
-        const fileRef = ref(storage, path);
         setUpPct(0);
-        await uploadWithProgress(fileRef, blob, setUpPct);
-        photos.push({ url: await getDownloadURL(fileRef), w, h: hh, path });
+        const up = await uploadImage(blob, 'portfolio', storeCfg, setUpPct);
+        photos.push({ url: up.url, w: up.w || w, h: up.h || hh, path: up.path });
       }
       const newShoot = {
         title: shootTitle.trim(),
         category: shootCategory,
         year: shootYear.trim(),
+        team: shootTeam.trim(),
         order: stamp,
         photos,
         cover: photos[0]?.url || '',
@@ -1017,7 +1141,7 @@ export default function Home() {
       const docRef = await addDoc(collection(db, 'portfolio_shoots'), newShoot);
       setPublicShoots(prev => [...prev, { id: docRef.id, ...newShoot }]);
       setShowAddShoot(false);
-      setShootTitle(''); setShootFiles([]); setShootYear('');
+      setShootTitle(''); setShootFiles([]); setShootYear(''); setShootTeam('');
     } catch (error) {
       setShootError('Не загрузилось: ' + (error.message || error.code || 'неизвестная ошибка'));
     } finally {
@@ -1039,10 +1163,9 @@ export default function Home() {
       catch (e) { throw new Error('кадр «до»: ' + e.message); }
 
       setBaStep('загружаю кадр «до»');
-      const refB = ref(storage, `before_after/${stamp}_before.jpg`);
       setUpPct(0);
-      await uploadWithProgress(refB, before.blob, setUpPct);
-      const beforeUrl = await getDownloadURL(refB);
+      const upBefore = await uploadImage(before.blob, 'before_after', storeCfg, setUpPct);
+      const beforeUrl = upBefore.url;
 
       setBaStep('готовлю кадр «после»');
       let after;
@@ -1050,10 +1173,9 @@ export default function Home() {
       catch (e) { throw new Error('кадр «после»: ' + e.message); }
 
       setBaStep('загружаю кадр «после»');
-      const refA = ref(storage, `before_after/${stamp}_after.jpg`);
       setUpPct(0);
-      await uploadWithProgress(refA, after.blob, setUpPct);
-      const afterUrl = await getDownloadURL(refA);
+      const upAfter = await uploadImage(after.blob, 'before_after', storeCfg, setUpPct);
+      const afterUrl = upAfter.url;
 
       setBaStep('сохраняю на сайт');
       const newBA = { title: baTitle.trim(), note: baNote.trim(), beforeUrl, afterUrl, order: stamp };
@@ -1079,9 +1201,8 @@ export default function Home() {
     try {
       setUpPct(0);
       const { blob } = await compressImage(file, 1800, 0.84);
-      const fileRef = ref(storage, `portfolio/site_${kind}_${Date.now()}.jpg`);
-      await uploadWithProgress(fileRef, blob, setUpPct);
-      const url = await getDownloadURL(fileRef);
+      const up = await uploadImage(blob, 'site', storeCfg, setUpPct);
+      const url = up.url;
       const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
       await setDoc(doc(db, 'site_settings', 'public'), { [field]: url }, { merge: true });
       setPublicSettings(prev => ({ ...(prev || {}), [field]: url }));
@@ -1097,6 +1218,16 @@ export default function Home() {
     const field = kind === 'hero' ? 'heroUrl' : 'aboutUrl';
     await setDoc(doc(db, 'site_settings', 'public'), { [field]: '' }, { merge: true });
     setPublicSettings(prev => ({ ...(prev || {}), [field]: '' }));
+  };
+
+  // Команда съёмки: одно свободное поле, выводится строкой под названием
+  const handleSaveTeam = async (shoot) => {
+    const team = (teamDraft[shoot.id] !== undefined ? teamDraft[shoot.id] : (shoot.team || '')).trim();
+    await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { team });
+    setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, team } : x)));
+    setTeamDraft(prev => ({ ...prev, [shoot.id]: team }));
+    setTeamSavedId(shoot.id);
+    setTimeout(() => setTeamSavedId(''), 2600);
   };
 
   // Кадры внутри съёмки: обложка, удаление, добавление
@@ -1123,11 +1254,9 @@ export default function Home() {
       for (let i = 0; i < list.length; i++) {
         setUploadStep(`${i + 1} / ${list.length}`);
         const { blob, w, h } = await compressImage(list[i], 1600, 0.82);
-        const path = `portfolio/${stamp}_add_${String(i + 1).padStart(2, '0')}.jpg`;
-        const fileRef = ref(storage, path);
         setUpPct(0);
-        await uploadWithProgress(fileRef, blob, setUpPct);
-        added.push({ url: await getDownloadURL(fileRef), w, h, path });
+        const up = await uploadImage(blob, 'portfolio', storeCfg, setUpPct);
+        added.push({ url: up.url, w: up.w || w, h: up.h || h, path: up.path });
       }
       const photos = [...(shoot.photos || []), ...added];
       const cover = shoot.cover || photos[0]?.url || '';
@@ -1345,6 +1474,13 @@ export default function Home() {
   const cleanResults = searchResults.filter(r =>
     !(r.status || '').includes('МУСОР') && !existingUsernamesDisplay.includes(r.username.toLowerCase())
   );
+
+  const allResultsSelected = cleanResults.length > 0 && cleanResults.every(r => selectedForBase.includes(r.id));
+
+  const toggleSelectAllResults = () => {
+    if (allResultsSelected) setSelectedForBase([]);
+    else setSelectedForBase(cleanResults.map(r => r.id));
+  };
 
   const displayLeads = leads
     .filter(lead => lead.status !== 'Rejected' && lead.niche !== 'Blacklist')
@@ -1589,7 +1725,7 @@ export default function Home() {
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Фото сайта</h3>
                     <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
                       Титульный кадр и портрет для раздела «Обо мне» ставятся только здесь. Сайт не берёт фото из съёмок автоматически.
-                      На мобильном интернете загрузка одного кадра может идти до минуты — на кнопке видно, что идёт.
+                      На кнопке виден процент загрузки.
                     </p>
                     {siteImgError && <span style={{ fontSize: '12px', color: '#8A3B33' }}>{siteImgError}</span>}
                     <div className="cms-2col tight">
@@ -1617,6 +1753,20 @@ export default function Home() {
                     <input value={editWa} onChange={e => setEditWa(e.target.value)} type="text" placeholder="WhatsApp URL (https://wa.me/48...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editIg} onChange={e => setEditIg(e.target.value)} type="text" placeholder="Instagram URL (https://instagram.com/...)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
                     <input value={editEmail} onChange={e => setEditEmail(e.target.value)} type="text" placeholder="Email (почта@домен.com)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+
+                    <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: '18px 0 0' }}>Хранилище фотографий</h3>
+                    <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.55, color: 'var(--mute)' }}>
+                      Все фото уходят в Cloudinary. Два значения из его настроек: Cloud name на главной странице аккаунта,
+                      Upload preset в Settings · Upload, режим Unsigned. Это публичные имена, не пароли.
+                    </p>
+                    <input value={cloudName} onChange={e => setCloudName(e.target.value)} type="text" placeholder="Cloud name (например dq8xk2abc)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+                    <input value={uploadPreset} onChange={e => setUploadPreset(e.target.value)} type="text" placeholder="Upload preset (например adriana_unsigned)" style={{ padding: '12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none' }} />
+                    <span style={{ fontSize: '12px', color: storeCfg.cloud && storeCfg.preset ? 'var(--mute)' : '#8A3B33' }}>
+                      {storeCfg.cloud && storeCfg.preset
+                        ? 'Значения заполнены — можно пробовать загрузку.'
+                        : 'Пока не заполнено — загрузка фото выдаст ошибку.'}
+                    </span>
+                    <button onClick={handleSaveSettings} className="badge solid" style={{ padding: '12px', cursor: 'pointer', border: 'none', width: 'fit-content' }}>Сохранить хранилище</button>
                   </div>
                 </div>
               )}
@@ -1651,6 +1801,20 @@ export default function Home() {
 
                          {openShootId === s.id && (
                            <div style={{ marginTop: '16px', borderTop: '1px solid var(--line-soft)', paddingTop: '16px' }}>
+                             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '18px' }}>
+                               <span className="mono-label">Команда съёмки</span>
+                               <textarea
+                                 rows={2}
+                                 placeholder="Фото — Аня К. · Модель — Саша · MUAH — Лера"
+                                 value={teamDraft[s.id] !== undefined ? teamDraft[s.id] : (s.team || '')}
+                                 onChange={e => setTeamDraft(prev => ({ ...prev, [s.id]: e.target.value }))}
+                                 style={{ padding: '10px 12px', border: '1px solid var(--line-soft)', background: 'transparent', outline: 'none', fontFamily: 'inherit', fontSize: '13px', resize: 'vertical' }}
+                               />
+                               <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
+                                 <button onClick={() => handleSaveTeam(s)} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '9px 16px' }}>Сохранить команду</button>
+                                 {teamSavedId === s.id && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>Сохранено, сайт обновлён</span>}
+                               </div>
+                             </div>
                              <div className="ph-grid">
                                {(s.photos || []).map((ph, i) => (
                                  <div key={ph.url + i} className={`ph ${s.cover === ph.url ? 'is-cover' : ''}`}>
@@ -1780,13 +1944,18 @@ export default function Home() {
                     <button disabled={selectedForBase.length === 0 || isRejecting} onClick={handleReject} className="badge solid" style={{ opacity: selectedForBase.length === 0 || isRejecting ? 0.5 : 1, padding: '10px 20px', cursor: selectedForBase.length === 0 ? 'not-allowed' : 'pointer', border: '1px solid var(--ink)', background: 'transparent', color: 'var(--ink)' }}>
                       {isRejecting ? 'Удаляем...' : 'В черный список 🚫'}
                     </button>
-                    {selectedForBase.length === 0 && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>← Выбери профили галочками слева</span>}
+                    <button onClick={toggleSelectAllResults} className="badge" style={{ padding: '10px 18px', cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink)' }}>
+                      {allResultsSelected ? 'Снять выделение' : `Выделить все (${cleanResults.length})`}
+                    </button>
+                    {selectedForBase.length === 0 && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>← Выбери профили галочками или нажми «Выделить все»</span>}
                   </div>
 
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', textAlign: 'left', marginBottom: '24px' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid var(--line-soft)' }}>
-                        <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)', width: '40px' }}>✓</th>
+                        <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)', width: '40px' }}>
+                          <input type="checkbox" checked={allResultsSelected} onChange={toggleSelectAllResults} title="Выделить все" style={{ cursor: 'pointer' }} />
+                        </th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Профиль</th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Аудитория</th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Email</th>
@@ -1857,6 +2026,113 @@ export default function Home() {
               </div>
             </div>
           )}
+
+          {activeTab === 'files' && (
+            <div>
+              <div className="sec-head" style={{ marginBottom: '20px' }}>
+                <div>
+                  <h2 className="display sec-title">хранилище</h2>
+                  <p className="mono-label" style={{ marginTop: '8px', color: 'var(--mute)' }}>
+                    Файлы лежат в Cloudflare R2 и доступны с любого устройства — компьютер включать не нужно
+                  </p>
+                </div>
+              </div>
+
+              <div className="st-bar">
+                <label className="badge solid st-upload">
+                  Загрузить файлы
+                  <input type="file" multiple style={{ display: 'none' }} onChange={(e) => { handleStorageUpload(e.target.files); e.target.value = ''; }} />
+                </label>
+                <button className="badge" onClick={handleStorageNewFolder} style={{ cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent' }}>Новая папка</button>
+                <button className="badge" onClick={() => loadStorage(stPrefix)} style={{ cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent' }}>Обновить</button>
+                <input
+                  type="text"
+                  value={stSearch}
+                  onChange={(e) => setStSearch(e.target.value)}
+                  placeholder="Поиск по названию"
+                  className="st-search"
+                />
+              </div>
+
+              <div className="st-crumbs">
+                <button className="st-crumb" onClick={() => loadStorage('')}>все файлы</button>
+                {stPrefix.split('/').filter(Boolean).map((part, i, arr) => (
+                  <span key={i}>
+                    <span className="st-sep">/</span>
+                    <button className="st-crumb" onClick={() => loadStorage(arr.slice(0, i + 1).join('/') + '/')}>{part}</button>
+                  </span>
+                ))}
+              </div>
+
+              {stUploads.length > 0 && (
+                <div className="st-uploads">
+                  {stUploads.map(u => (
+                    <div key={u.name} className="st-up">
+                      <div className="st-up-head">
+                        <span className="st-up-name">{u.name}</span>
+                        <span className="st-up-val">{u.error ? 'ошибка' : u.done ? 'готово' : `${u.percent}%`}</span>
+                      </div>
+                      <div className="st-track"><div className="st-fill" style={{ width: `${u.percent}%`, background: u.error ? '#8A3B33' : 'var(--ink)' }} /></div>
+                      {u.error && <div className="st-up-err">{u.error}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {stError && <div className="st-error">{stError}</div>}
+              {stLoading && <p className="mono-label" style={{ padding: '18px 0', color: 'var(--mute)' }}>Загружаю список…</p>}
+
+              {!stLoading && !stError && stFolders.length === 0 && stFiles.length === 0 && (
+                <p className="mono-label" style={{ padding: '18px 0', color: 'var(--mute)' }}>
+                  {stPrefix ? 'В этой папке пока пусто.' : 'Хранилище пустое. Создай папку под съёмку и загрузи файлы.'}
+                </p>
+              )}
+
+              <div className="st-list">
+                {stFolders
+                  .filter(f => !stSearch || f.toLowerCase().includes(stSearch.toLowerCase()))
+                  .map(folder => {
+                    const name = folder.replace(stPrefix, '').replace(/\/$/, '');
+                    return (
+                      <div key={folder} className="st-row st-folder" onClick={() => loadStorage(folder)}>
+                        <div className="st-name">
+                          <span className="st-kind">папка</span>
+                          <span className="st-title">{name}</span>
+                        </div>
+                        <div className="st-actions"><span className="st-open">открыть</span></div>
+                      </div>
+                    );
+                  })}
+
+                {stFiles
+                  .filter(f => !stSearch || f.key.toLowerCase().includes(stSearch.toLowerCase()))
+                  .map(file => {
+                    const name = file.key.split('/').pop();
+                    const date = file.modified ? new Date(file.modified).toLocaleDateString('ru-RU') : '';
+                    return (
+                      <div key={file.key} className="st-row">
+                        <div className="st-name">
+                          <span className="st-title">{name}</span>
+                          <span className="st-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
+                        </div>
+                        <div className="st-actions">
+                          <button className="st-btn" disabled={stBusyKey === file.key} onClick={() => handleStorageDownload(file)}>
+                            {stBusyKey === file.key ? 'готовлю…' : 'скачать'}
+                          </button>
+                          <button className="st-btn st-del" disabled={stBusyKey === file.key} onClick={() => handleStorageDelete(file)}>удалить</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+
+              {stFiles.length > 0 && (
+                <div className="st-total mono-label">
+                  {stFiles.length} файл(ов) в этой папке · {humanSize(stFiles.reduce((sum, f) => sum + (f.size || 0), 0))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </main>
 
@@ -1884,6 +2160,8 @@ export default function Home() {
             </select>
 
             <input type="text" placeholder="Год (необязательно, например: 2026)" value={shootYear} onChange={e => setShootYear(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
+
+            <textarea rows={2} placeholder="Команда (например: Фото — Аня К. · Модель — Саша · MUAH — Лера)" value={shootTeam} onChange={e => setShootTeam(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit', resize: 'vertical' }} />
             
             <div style={{ border: '1px dashed var(--ink)', padding: '24px', textAlign: 'center', background: 'var(--paper-2)' }}>
                <input type="file" multiple accept="image/*" onChange={(e) => setShootFiles(Array.from(e.target.files || []))} style={{ width: '100%' }} />
@@ -2079,8 +2357,8 @@ button{font-family:inherit}
 .drawer-admin:hover{color:#F4F2EF}
 
 /* ── hero ── */
-.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center;padding:52px 24px 64px}
-@media (min-width:900px){.hero{padding:64px 56px 84px}}
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:start;padding:40px 24px 64px}
+@media (min-width:900px){.hero{padding:44px 56px 84px}}
 .hero-l{display:flex;flex-direction:column}
 .hero-l h1{margin:0}
 .hero-over{font-family:'Archivo',sans-serif;font-weight:800;text-transform:lowercase;letter-spacing:-.03em;color:rgba(11,11,10,.10);font-size:clamp(26px,4.4vw,58px);line-height:.9;margin-bottom:-1.4vw}
@@ -2095,7 +2373,7 @@ button{font-family:inherit}
 .btn.ghost{background:transparent;color:var(--ink)}
 .btn.ghost:hover{background:var(--ink);color:var(--paper)}
 .hero-img{position:relative;margin:0}
-.hero-img img{width:100%;height:clamp(360px,52vw,660px);object-fit:cover;object-position:center 22%}
+.hero-img img{display:block;width:auto;height:auto;max-width:100%;max-height:78vh;margin:0 auto}
 .hero-img figcaption{display:flex;justify-content:space-between;gap:12px;padding-top:10px}
 
 /* ── секции ── */
@@ -2136,6 +2414,7 @@ button{font-family:inherit}
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
+.cell{min-width:0}
 .cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0;margin:0}
 .cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
@@ -2166,6 +2445,13 @@ button{font-family:inherit}
 /* ── тест-ретушь ── */
 .testgrid{display:grid;grid-template-columns:.85fr 1.15fr;gap:52px;align-items:start}
 .steps{border-top:1px solid var(--line)}
+/* белая карточка формы внутри чёрной секции: переопределяем переменные обратно на светлые */
+.testform{background:#F4F2EF;color:#0B0B0A;padding:30px 28px 32px;--ink:#0B0B0A;--paper:#F4F2EF;--paper-2:#EAE7E2;--line:#D6D2CB;--line-soft:#E2DFD9;--mute:#7C776E;--accent:#A79E90}
+.testform ::placeholder{color:#9A958C}
+.testform select option{background:#F4F2EF;color:#0B0B0A}
+@media (max-width:760px){.testform{padding:22px 18px 24px}}
+.shoot-t{min-width:0}
+.shoot-team{margin-top:8px;font-size:12px;line-height:1.6;color:var(--mute);max-width:80ch}
 .step{display:flex;gap:16px;padding:20px 0;border-bottom:1px solid var(--line-soft)}
 .step:last-child{border-bottom:0}
 .step-t{font-family:'Archivo',sans-serif;font-weight:600;font-size:16px;letter-spacing:-.01em}
@@ -2235,9 +2521,10 @@ footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:
   .hero-cta .btn{flex:1 1 100%;justify-content:center}
   .sec{padding:52px 20px 58px}
   .sec-head{padding-bottom:26px}
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
-  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+  .mrow{flex-direction:column;gap:10px}
+  .mrow .cell{width:100%!important;flex:none!important;max-width:100%!important}
+  .cell{height:auto!important}
+  .mrow.single .cell{width:100%!important;max-width:100%!important}
   .site-footer{padding-bottom:96px}
   .mob-cta{display:flex;position:fixed;left:14px;right:14px;bottom:14px;z-index:88;align-items:center;justify-content:center;gap:10px;padding:16px;background:#0B0B0A;color:#F4F2EF;text-decoration:none;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;box-shadow:0 10px 30px rgba(11,11,10,.25);transform:translateY(140%);transition:transform .35s cubic-bezier(.2,.7,.2,1)}
   .mob-cta.on{transform:translateY(0)}
@@ -2305,7 +2592,7 @@ nav.tabs::-webkit-scrollbar{display:none}
 .ph-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
 .ph{position:relative;border:1px solid var(--line-soft);background:var(--paper);min-width:0}
 .ph.is-cover{border-color:var(--ink)}
-.ph img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover}
+.ph img{display:block;width:100%;aspect-ratio:3/4;object-fit:contain;background:var(--paper-2)}
 .ph-acts{display:flex;justify-content:space-between;gap:8px;padding:6px 8px;border-top:1px solid var(--line-soft)}
 .ph-acts button{appearance:none;background:none;border:0;cursor:pointer;color:var(--mute);font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.14em;text-transform:uppercase;padding:2px 0;text-decoration:underline}
 .ph-acts button:hover{color:var(--ink)}
@@ -2331,6 +2618,44 @@ td{padding:22px 12px 22px 0;font-size:14px;vertical-align:middle}
 .open{appearance:none;background:none;border:0;cursor:pointer;padding:0 0 2px;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;border-bottom:1px solid var(--ink);color:var(--ink)}
 .open:hover{color:var(--mute);border-color:var(--mute)}
 
+/* ───────── хранилище съёмок ───────── */
+.st-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.st-upload{padding:12px 20px;cursor:pointer;border:none;background:var(--ink);color:var(--paper);font-size:11px}
+.st-bar .badge{padding:12px 18px;font-size:11px}
+.st-search{flex:1 1 220px;min-width:0;padding:11px 14px;border:1px solid var(--line-soft);background:transparent;font-family:inherit;font-size:13px;outline:none}
+.st-crumbs{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:14px;font-family:'Archivo',sans-serif;font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+.st-crumb{background:none;border:0;padding:4px 2px;cursor:pointer;color:var(--mute);font:inherit;letter-spacing:inherit;text-transform:inherit}
+.st-crumb:hover{color:var(--ink)}
+.st-sep{color:var(--line);margin:0 4px}
+.st-uploads{border:1px solid var(--line-soft);padding:14px 16px;margin-bottom:16px;display:flex;flex-direction:column;gap:12px}
+.st-up-head{display:flex;justify-content:space-between;gap:12px;font-size:12px;margin-bottom:6px}
+.st-up-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-up-val{color:var(--mute);font-family:'Archivo',sans-serif;font-size:11px;letter-spacing:.14em;text-transform:uppercase;flex:none}
+.st-track{height:2px;background:var(--line-soft)}
+.st-fill{height:100%;transition:width .2s}
+.st-up-err{margin-top:6px;font-size:12px;color:#8A3B33}
+.st-error{border:1px solid #8A3B33;color:#8A3B33;padding:12px 14px;font-size:13px;line-height:1.5;margin-bottom:16px}
+.st-list{border-top:1px solid var(--line-soft)}
+.st-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 4px;border-bottom:1px solid var(--line-soft)}
+.st-folder{cursor:pointer}
+.st-folder:hover{background:var(--paper-2)}
+.st-name{display:flex;flex-direction:column;gap:4px;min-width:0}
+.st-kind{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
+.st-title{font-size:14px;overflow-wrap:anywhere}
+.st-meta{font-size:12px;color:var(--mute)}
+.st-actions{display:flex;gap:8px;flex:none}
+.st-open{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
+.st-btn{padding:9px 14px;border:1px solid var(--line);background:transparent;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.16em;text-transform:uppercase;cursor:pointer;color:var(--ink)}
+.st-btn:hover{background:var(--ink);color:var(--paper)}
+.st-btn:disabled{opacity:.5;cursor:default}
+.st-del:hover{background:#8A3B33;border-color:#8A3B33;color:#fff}
+.st-total{margin-top:16px;color:var(--mute)}
+@media (max-width:760px){
+  .st-row{flex-direction:column;align-items:flex-start;gap:10px}
+  .st-actions{width:100%}
+  .st-btn{flex:1;padding:13px 10px}
+  .st-upload,.st-bar .badge{flex:1 1 auto;text-align:center}
+}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--ink)}
 .stat{padding:28px 24px 30px;border-right:1px solid var(--line-soft)}
 .stat:first-child{padding-left:0}
@@ -2376,6 +2701,7 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
+.cell{min-width:0}
 .cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0; margin:0;}
 .cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
@@ -2395,9 +2721,10 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 /* --- МОБИЛЬНАЯ АДАПТАЦИЯ --- */
 @media (max-width:760px){
   .sec-portfolio { padding: 40px 24px !important; }
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
-  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+  .mrow{flex-direction:column;gap:10px}
+  .mrow .cell{width:100%!important;flex:none!important;max-width:100%!important}
+  .cell{height:auto!important}
+  .mrow.single .cell{width:100%!important;max-width:100%!important}
   .hero-main { font-size: 14vw !important; }
 }
 `;
