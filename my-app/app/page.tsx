@@ -26,6 +26,7 @@ const TABS = [
   { id: 'portfolio', num: '03', label: 'Сайт и портфолио' },
   { id: 'orders', num: '04', label: 'Учет заказов' },
   { id: 'mail', num: '05', label: 'Рассылка' },
+  { id: 'files', num: '06', label: 'Хранилище' },
 ];
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:5000';
@@ -69,22 +70,23 @@ function rowsFor(n) {
   }
   return r;
 }
-const W = { 1: [1], 2: [[1.32, 1], [1, 1.32]], 3: [[1, 1.24, 1], [1.24, 1, 1.1]] };
-const H = { 1: ['100%'], 2: [['100%', '87%'], ['88%', '100%']], 3: [['93%', '100%', '85%'], ['100%', '86%', '96%']] };
-const ROWH = { 1: 'clamp(400px,46vw,600px)', 2: 'clamp(300px,32vw,500px)', 3: 'clamp(230px,23vw,370px)' };
+/* Пропорция кадра. Раньше ряды имели жёсткую высоту, а кадры внутри обрезались
+   по object-fit:cover — поэтому на разных экранах у горизонтальных фото срезало края.
+   Теперь каждая ячейка получает пропорцию самого кадра, и обрезки нет вообще. */
+const AR_MIN = 0.42, AR_MAX = 2.4;
+function photoAr(p) {
+  const w = Number(p && p.w) || 0, h = Number(p && p.h) || 0;
+  if (w > 0 && h > 0) return Math.min(AR_MAX, Math.max(AR_MIN, w / h));
+  return 0.75; // старые кадры без сохранённых размеров: вертикаль 3/4, уточним после загрузки
+}
 
 function buildRows(photos) {
   if (!photos || photos.length === 0) return [];
   const sizes = rowsFor(photos.length);
   const out = []; let i = 0;
-  sizes.forEach((size, ri) => {
-    const items = photos.slice(i, i + size).map((p, k) => ({
-      photo: p,
-      idx: i + k,
-      flex: size === 1 ? 1 : W[size][ri % 2][k],
-      h: size === 1 ? '100%' : H[size][ri % 2][k],
-    }));
-    out.push({ size, h: ROWH[size], items, single: size === 1 });
+  sizes.forEach((size) => {
+    const items = photos.slice(i, i + size).map((p, k) => ({ photo: p, idx: i + k, ar: photoAr(p) }));
+    out.push({ size, items, single: size === 1 });
     i += size;
   });
   return out;
@@ -414,6 +416,14 @@ function PublicSite({ onAdminClick }) {
   const [settings, setSettings] = useState(null);
   const [cat, setCat] = useState(CATEGORIES[0].id);
   const [lb, setLb] = useState({ list: [], idx: null });
+  // пропорции кадров, измеренные прямо из файлов — нужны старым фото без сохранённых размеров
+  const [measuredAr, setMeasuredAr] = useState({});
+  const measure = (url, el) => {
+    const w = el && el.naturalWidth, h = el && el.naturalHeight;
+    if (!w || !h) return;
+    const real = Math.min(AR_MAX, Math.max(AR_MIN, w / h));
+    setMeasuredAr((prev) => (Math.abs((prev[url] || 0) - real) < 0.005 ? prev : { ...prev, [url]: real }));
+  };
   const [loading, setLoading] = useState(true);
   const [scrolled, setScrolled] = useState(false); // ушли ниже первого экрана
   const [menu, setMenu] = useState(false);         // открыто боковое меню
@@ -664,22 +674,31 @@ function PublicSite({ onAdminClick }) {
             </header>
             <div className="mosaic">
               {buildRows(s.photos).map((row, ri) => (
-                <div className={`mrow ${row.single ? 'single' : ''}`} style={{ height: row.h }} key={ri}>
-                  {row.items.map((it) => (
-                    <figure
-                      key={it.idx}
-                      className="cell"
-                      data-n={String(it.idx + 1).padStart(2, '0')}
-                      style={{
-                        flex: `${it.flex} 1 0`,
-                        height: it.h,
-                        ...(row.single ? { maxWidth: '66%', marginLeft: 'auto', marginRight: 'auto' } : {}),
-                      }}
-                      onClick={() => openLb(s, it.idx)}
-                    >
-                      <img src={it.photo.url} alt={`${s.title} — кадр ${it.idx + 1}`} loading="lazy" />
-                    </figure>
-                  ))}
+                <div className={`mrow ${row.single ? 'single' : ''}`} key={ri}>
+                  {row.items.map((it) => {
+                    // ширина ячейки пропорциональна пропорции кадра, высота считается из неё —
+                    // поэтому кадры в ряду совпадают по высоте, а кропа нет
+                    const ar = measuredAr[it.photo.url] || it.ar;
+                    return (
+                      <figure
+                        key={it.idx}
+                        className="cell"
+                        data-n={String(it.idx + 1).padStart(2, '0')}
+                        style={row.single
+                          ? { aspectRatio: String(ar), width: `min(100%, calc(74vh * ${ar}))`, marginLeft: 'auto', marginRight: 'auto' }
+                          : { flex: `${ar} 1 0`, aspectRatio: String(ar) }}
+                        onClick={() => openLb(s, it.idx)}
+                      >
+                        <img
+                          src={it.photo.url}
+                          alt={`${s.title} — кадр ${it.idx + 1}`}
+                          loading="lazy"
+                          ref={(el) => { if (el && el.complete) measure(it.photo.url, el); }}
+                          onLoad={(e) => measure(it.photo.url, e.currentTarget)}
+                        />
+                      </figure>
+                    );
+                  })}
                 </div>
               ))}
             </div>
@@ -835,6 +854,124 @@ export default function Home() {
   const [shootFiles, setShootFiles] = useState([]);
   const [teamDraft, setTeamDraft] = useState({});   // id съёмки → текст команды, пока правим
   const [teamSavedId, setTeamSavedId] = useState('');
+  // ───────── облачное хранилище съёмок (Cloudflare R2 через /api/storage) ─────────
+  const [stPrefix, setStPrefix] = useState('');       // текущая папка
+  const [stFolders, setStFolders] = useState([]);
+  const [stFiles, setStFiles] = useState([]);
+  const [stLoading, setStLoading] = useState(false);
+  const [stError, setStError] = useState('');
+  const [stSearch, setStSearch] = useState('');
+  const [stUploads, setStUploads] = useState([]);     // [{name, percent, error, done}]
+  const [stBusyKey, setStBusyKey] = useState('');
+
+  const humanSize = (n) => {
+    if (!n && n !== 0) return '';
+    if (n < 1024) return n + ' Б';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' КБ';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' МБ';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' ГБ';
+  };
+
+  const stAuthHeader = async () => {
+    const user = auth.currentUser;
+    if (!user) throw new Error('Нужно войти в дашборд заново');
+    const token = await user.getIdToken();
+    return { Authorization: `Bearer ${token}` };
+  };
+
+  const stApi = async (body) => {
+    const headers = { ...(await stAuthHeader()), 'Content-Type': 'application/json' };
+    const r = await fetch('/api/storage', { method: 'POST', headers, body: JSON.stringify(body) });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `Сервер ответил ${r.status}`);
+    return data;
+  };
+
+  const loadStorage = async (prefix = stPrefix) => {
+    setStLoading(true); setStError('');
+    try {
+      const headers = await stAuthHeader();
+      const r = await fetch(`/api/storage?prefix=${encodeURIComponent(prefix)}`, { headers });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `Сервер ответил ${r.status}`);
+      setStFolders(data.folders || []);
+      setStFiles(data.files || []);
+      setStPrefix(prefix);
+    } catch (e) {
+      setStError(e.message);
+      setStFolders([]); setStFiles([]);
+    }
+    setStLoading(false);
+  };
+
+  useEffect(() => {
+    if (activeTab === 'files' && user) loadStorage(stPrefix);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, user]);
+
+  // Файл идёт прямо в Cloudflare по временной ссылке — мимо сайта, поэтому размер не ограничен
+  const uploadOneToStorage = (file, url) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+    xhr.timeout = 6 * 60 * 60 * 1000;
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const percent = Math.round((e.loaded / e.total) * 100);
+      setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, percent } : u)));
+    };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Cloudflare ответил ${xhr.status}`)));
+    xhr.onerror = () => reject(new Error('Обрыв связи. Проверь CORS-правило корзины и интернет'));
+    xhr.ontimeout = () => reject(new Error('Загрузка не уложилась во время'));
+    xhr.send(file);
+  });
+
+  const handleStorageUpload = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    setStUploads(files.map(f => ({ name: f.name, percent: 0 })));
+    for (const file of files) {
+      try {
+        const key = `${stPrefix}${file.name}`;
+        const { url } = await stApi({ action: 'upload-url', key });
+        await uploadOneToStorage(file, url);
+        setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, percent: 100, done: true } : u)));
+      } catch (e) {
+        setStUploads(prev => prev.map(u => (u.name === file.name ? { ...u, error: e.message } : u)));
+      }
+    }
+    await loadStorage(stPrefix);
+    setTimeout(() => setStUploads(prev => prev.filter(u => u.error)), 2500);
+  };
+
+  const handleStorageDownload = async (file) => {
+    setStBusyKey(file.key);
+    try {
+      const name = file.key.split('/').pop();
+      const { url } = await stApi({ action: 'download-url', key: file.key, name });
+      window.location.href = url;
+    } catch (e) { setStError(e.message); }
+    setStBusyKey('');
+  };
+
+  const handleStorageDelete = async (file) => {
+    if (!confirm(`Удалить «${file.key.split('/').pop()}» из хранилища? Это необратимо.`)) return;
+    setStBusyKey(file.key);
+    try {
+      await stApi({ action: 'delete', key: file.key });
+      await loadStorage(stPrefix);
+    } catch (e) { setStError(e.message); }
+    setStBusyKey('');
+  };
+
+  const handleStorageNewFolder = async () => {
+    const name = prompt('Название папки (например: 2026-09 Ювелирка Katarzyna)');
+    if (!name || !name.trim()) return;
+    try {
+      await stApi({ action: 'make-folder', key: `${stPrefix}${name.trim()}` });
+      await loadStorage(stPrefix);
+    } catch (e) { setStError(e.message); }
+  };
+
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStep, setUploadStep] = useState('');
 
@@ -1338,6 +1475,13 @@ export default function Home() {
     !(r.status || '').includes('МУСОР') && !existingUsernamesDisplay.includes(r.username.toLowerCase())
   );
 
+  const allResultsSelected = cleanResults.length > 0 && cleanResults.every(r => selectedForBase.includes(r.id));
+
+  const toggleSelectAllResults = () => {
+    if (allResultsSelected) setSelectedForBase([]);
+    else setSelectedForBase(cleanResults.map(r => r.id));
+  };
+
   const displayLeads = leads
     .filter(lead => lead.status !== 'Rejected' && lead.niche !== 'Blacklist')
     .filter((lead, index, self) => index === self.findIndex((t) => t.username.toLowerCase() === lead.username.toLowerCase()));
@@ -1800,13 +1944,18 @@ export default function Home() {
                     <button disabled={selectedForBase.length === 0 || isRejecting} onClick={handleReject} className="badge solid" style={{ opacity: selectedForBase.length === 0 || isRejecting ? 0.5 : 1, padding: '10px 20px', cursor: selectedForBase.length === 0 ? 'not-allowed' : 'pointer', border: '1px solid var(--ink)', background: 'transparent', color: 'var(--ink)' }}>
                       {isRejecting ? 'Удаляем...' : 'В черный список 🚫'}
                     </button>
-                    {selectedForBase.length === 0 && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>← Выбери профили галочками слева</span>}
+                    <button onClick={toggleSelectAllResults} className="badge" style={{ padding: '10px 18px', cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent', color: 'var(--ink)' }}>
+                      {allResultsSelected ? 'Снять выделение' : `Выделить все (${cleanResults.length})`}
+                    </button>
+                    {selectedForBase.length === 0 && <span style={{ fontSize: '12px', color: 'var(--mute)' }}>← Выбери профили галочками или нажми «Выделить все»</span>}
                   </div>
 
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', textAlign: 'left', marginBottom: '24px' }}>
                     <thead>
                       <tr style={{ borderBottom: '1px solid var(--line-soft)' }}>
-                        <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)', width: '40px' }}>✓</th>
+                        <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)', width: '40px' }}>
+                          <input type="checkbox" checked={allResultsSelected} onChange={toggleSelectAllResults} title="Выделить все" style={{ cursor: 'pointer' }} />
+                        </th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Профиль</th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Аудитория</th>
                         <th style={{ padding: '12px 16px', fontWeight: 'normal', color: 'var(--ink-50)' }}>Email</th>
@@ -1875,6 +2024,113 @@ export default function Home() {
                   <button className="badge solid" style={{ padding: '14px', cursor: 'pointer', textAlign: 'center', fontSize: '12px', border: 'none' }}>Отправить предложение ✉️</button>
                 </div>
               </div>
+            </div>
+          )}
+
+          {activeTab === 'files' && (
+            <div>
+              <div className="sec-head" style={{ marginBottom: '20px' }}>
+                <div>
+                  <h2 className="display sec-title">хранилище</h2>
+                  <p className="mono-label" style={{ marginTop: '8px', color: 'var(--mute)' }}>
+                    Файлы лежат в Cloudflare R2 и доступны с любого устройства — компьютер включать не нужно
+                  </p>
+                </div>
+              </div>
+
+              <div className="st-bar">
+                <label className="badge solid st-upload">
+                  Загрузить файлы
+                  <input type="file" multiple style={{ display: 'none' }} onChange={(e) => { handleStorageUpload(e.target.files); e.target.value = ''; }} />
+                </label>
+                <button className="badge" onClick={handleStorageNewFolder} style={{ cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent' }}>Новая папка</button>
+                <button className="badge" onClick={() => loadStorage(stPrefix)} style={{ cursor: 'pointer', border: '1px solid var(--line)', background: 'transparent' }}>Обновить</button>
+                <input
+                  type="text"
+                  value={stSearch}
+                  onChange={(e) => setStSearch(e.target.value)}
+                  placeholder="Поиск по названию"
+                  className="st-search"
+                />
+              </div>
+
+              <div className="st-crumbs">
+                <button className="st-crumb" onClick={() => loadStorage('')}>все файлы</button>
+                {stPrefix.split('/').filter(Boolean).map((part, i, arr) => (
+                  <span key={i}>
+                    <span className="st-sep">/</span>
+                    <button className="st-crumb" onClick={() => loadStorage(arr.slice(0, i + 1).join('/') + '/')}>{part}</button>
+                  </span>
+                ))}
+              </div>
+
+              {stUploads.length > 0 && (
+                <div className="st-uploads">
+                  {stUploads.map(u => (
+                    <div key={u.name} className="st-up">
+                      <div className="st-up-head">
+                        <span className="st-up-name">{u.name}</span>
+                        <span className="st-up-val">{u.error ? 'ошибка' : u.done ? 'готово' : `${u.percent}%`}</span>
+                      </div>
+                      <div className="st-track"><div className="st-fill" style={{ width: `${u.percent}%`, background: u.error ? '#8A3B33' : 'var(--ink)' }} /></div>
+                      {u.error && <div className="st-up-err">{u.error}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {stError && <div className="st-error">{stError}</div>}
+              {stLoading && <p className="mono-label" style={{ padding: '18px 0', color: 'var(--mute)' }}>Загружаю список…</p>}
+
+              {!stLoading && !stError && stFolders.length === 0 && stFiles.length === 0 && (
+                <p className="mono-label" style={{ padding: '18px 0', color: 'var(--mute)' }}>
+                  {stPrefix ? 'В этой папке пока пусто.' : 'Хранилище пустое. Создай папку под съёмку и загрузи файлы.'}
+                </p>
+              )}
+
+              <div className="st-list">
+                {stFolders
+                  .filter(f => !stSearch || f.toLowerCase().includes(stSearch.toLowerCase()))
+                  .map(folder => {
+                    const name = folder.replace(stPrefix, '').replace(/\/$/, '');
+                    return (
+                      <div key={folder} className="st-row st-folder" onClick={() => loadStorage(folder)}>
+                        <div className="st-name">
+                          <span className="st-kind">папка</span>
+                          <span className="st-title">{name}</span>
+                        </div>
+                        <div className="st-actions"><span className="st-open">открыть</span></div>
+                      </div>
+                    );
+                  })}
+
+                {stFiles
+                  .filter(f => !stSearch || f.key.toLowerCase().includes(stSearch.toLowerCase()))
+                  .map(file => {
+                    const name = file.key.split('/').pop();
+                    const date = file.modified ? new Date(file.modified).toLocaleDateString('ru-RU') : '';
+                    return (
+                      <div key={file.key} className="st-row">
+                        <div className="st-name">
+                          <span className="st-title">{name}</span>
+                          <span className="st-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
+                        </div>
+                        <div className="st-actions">
+                          <button className="st-btn" disabled={stBusyKey === file.key} onClick={() => handleStorageDownload(file)}>
+                            {stBusyKey === file.key ? 'готовлю…' : 'скачать'}
+                          </button>
+                          <button className="st-btn st-del" disabled={stBusyKey === file.key} onClick={() => handleStorageDelete(file)}>удалить</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+
+              {stFiles.length > 0 && (
+                <div className="st-total mono-label">
+                  {stFiles.length} файл(ов) в этой папке · {humanSize(stFiles.reduce((sum, f) => sum + (f.size || 0), 0))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2117,7 +2373,7 @@ button{font-family:inherit}
 .btn.ghost{background:transparent;color:var(--ink)}
 .btn.ghost:hover{background:var(--ink);color:var(--paper)}
 .hero-img{position:relative;margin:0}
-.hero-img img{width:100%;height:clamp(360px,52vw,660px);object-fit:cover;object-position:center 22%}
+.hero-img img{display:block;width:auto;height:auto;max-width:100%;max-height:78vh;margin:0 auto}
 .hero-img figcaption{display:flex;justify-content:space-between;gap:12px;padding-top:10px}
 
 /* ── секции ── */
@@ -2158,6 +2414,7 @@ button{font-family:inherit}
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
+.cell{min-width:0}
 .cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0;margin:0}
 .cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
@@ -2264,9 +2521,10 @@ footer,.site-footer{border-top:1px solid #2A2825;padding:26px 24px 34px;display:
   .hero-cta .btn{flex:1 1 100%;justify-content:center}
   .sec{padding:52px 20px 58px}
   .sec-head{padding-bottom:26px}
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
-  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+  .mrow{flex-direction:column;gap:10px}
+  .mrow .cell{width:100%!important;flex:none!important;max-width:100%!important}
+  .cell{height:auto!important}
+  .mrow.single .cell{width:100%!important;max-width:100%!important}
   .site-footer{padding-bottom:96px}
   .mob-cta{display:flex;position:fixed;left:14px;right:14px;bottom:14px;z-index:88;align-items:center;justify-content:center;gap:10px;padding:16px;background:#0B0B0A;color:#F4F2EF;text-decoration:none;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;box-shadow:0 10px 30px rgba(11,11,10,.25);transform:translateY(140%);transition:transform .35s cubic-bezier(.2,.7,.2,1)}
   .mob-cta.on{transform:translateY(0)}
@@ -2334,7 +2592,7 @@ nav.tabs::-webkit-scrollbar{display:none}
 .ph-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
 .ph{position:relative;border:1px solid var(--line-soft);background:var(--paper);min-width:0}
 .ph.is-cover{border-color:var(--ink)}
-.ph img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover}
+.ph img{display:block;width:100%;aspect-ratio:3/4;object-fit:contain;background:var(--paper-2)}
 .ph-acts{display:flex;justify-content:space-between;gap:8px;padding:6px 8px;border-top:1px solid var(--line-soft)}
 .ph-acts button{appearance:none;background:none;border:0;cursor:pointer;color:var(--mute);font-family:'Archivo',sans-serif;font-size:9px;letter-spacing:.14em;text-transform:uppercase;padding:2px 0;text-decoration:underline}
 .ph-acts button:hover{color:var(--ink)}
@@ -2360,6 +2618,44 @@ td{padding:22px 12px 22px 0;font-size:14px;vertical-align:middle}
 .open{appearance:none;background:none;border:0;cursor:pointer;padding:0 0 2px;font-family:'Archivo',sans-serif;font-size:10px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;border-bottom:1px solid var(--ink);color:var(--ink)}
 .open:hover{color:var(--mute);border-color:var(--mute)}
 
+/* ───────── хранилище съёмок ───────── */
+.st-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.st-upload{padding:12px 20px;cursor:pointer;border:none;background:var(--ink);color:var(--paper);font-size:11px}
+.st-bar .badge{padding:12px 18px;font-size:11px}
+.st-search{flex:1 1 220px;min-width:0;padding:11px 14px;border:1px solid var(--line-soft);background:transparent;font-family:inherit;font-size:13px;outline:none}
+.st-crumbs{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:14px;font-family:'Archivo',sans-serif;font-size:11px;letter-spacing:.18em;text-transform:uppercase}
+.st-crumb{background:none;border:0;padding:4px 2px;cursor:pointer;color:var(--mute);font:inherit;letter-spacing:inherit;text-transform:inherit}
+.st-crumb:hover{color:var(--ink)}
+.st-sep{color:var(--line);margin:0 4px}
+.st-uploads{border:1px solid var(--line-soft);padding:14px 16px;margin-bottom:16px;display:flex;flex-direction:column;gap:12px}
+.st-up-head{display:flex;justify-content:space-between;gap:12px;font-size:12px;margin-bottom:6px}
+.st-up-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st-up-val{color:var(--mute);font-family:'Archivo',sans-serif;font-size:11px;letter-spacing:.14em;text-transform:uppercase;flex:none}
+.st-track{height:2px;background:var(--line-soft)}
+.st-fill{height:100%;transition:width .2s}
+.st-up-err{margin-top:6px;font-size:12px;color:#8A3B33}
+.st-error{border:1px solid #8A3B33;color:#8A3B33;padding:12px 14px;font-size:13px;line-height:1.5;margin-bottom:16px}
+.st-list{border-top:1px solid var(--line-soft)}
+.st-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 4px;border-bottom:1px solid var(--line-soft)}
+.st-folder{cursor:pointer}
+.st-folder:hover{background:var(--paper-2)}
+.st-name{display:flex;flex-direction:column;gap:4px;min-width:0}
+.st-kind{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
+.st-title{font-size:14px;overflow-wrap:anywhere}
+.st-meta{font-size:12px;color:var(--mute)}
+.st-actions{display:flex;gap:8px;flex:none}
+.st-open{font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mute)}
+.st-btn{padding:9px 14px;border:1px solid var(--line);background:transparent;font-family:'Archivo',sans-serif;font-size:10px;letter-spacing:.16em;text-transform:uppercase;cursor:pointer;color:var(--ink)}
+.st-btn:hover{background:var(--ink);color:var(--paper)}
+.st-btn:disabled{opacity:.5;cursor:default}
+.st-del:hover{background:#8A3B33;border-color:#8A3B33;color:#fff}
+.st-total{margin-top:16px;color:var(--mute)}
+@media (max-width:760px){
+  .st-row{flex-direction:column;align-items:flex-start;gap:10px}
+  .st-actions{width:100%}
+  .st-btn{flex:1;padding:13px 10px}
+  .st-upload,.st-bar .badge{flex:1 1 auto;text-align:center}
+}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--ink)}
 .stat{padding:28px 24px 30px;border-right:1px solid var(--line-soft)}
 .stat:first-child{padding-left:0}
@@ -2405,6 +2701,7 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 .shoot-meta{display:flex;gap:20px;align-items:baseline}
 .mosaic{display:flex;flex-direction:column;gap:14px}
 .mrow{display:flex;gap:14px;align-items:flex-start}
+.cell{min-width:0}
 .cell{position:relative;overflow:hidden;cursor:zoom-in;background:var(--paper-2);min-width:0; margin:0;}
 .cell img{width:100%;height:100%;object-fit:cover;object-position:center 30%;transition:transform .8s cubic-bezier(.2,.7,.2,1),filter .4s}
 .cell:hover img{transform:scale(1.03)}
@@ -2424,9 +2721,10 @@ footer{display:flex;justify-content:space-between;gap:16px;padding:16px 24px;bor
 /* --- МОБИЛЬНАЯ АДАПТАЦИЯ --- */
 @media (max-width:760px){
   .sec-portfolio { padding: 40px 24px !important; }
-  .mrow{flex-wrap:wrap;gap:10px}
-  .cell{flex:1 1 calc(50% - 5px) !important;height:56vw !important}
-  .mrow.single .cell{flex:1 1 100% !important;height:118vw !important;max-height:560px;max-width:100% !important}
+  .mrow{flex-direction:column;gap:10px}
+  .mrow .cell{width:100%!important;flex:none!important;max-width:100%!important}
+  .cell{height:auto!important}
+  .mrow.single .cell{width:100%!important;max-width:100%!important}
   .hero-main { font-size: 14vw !important; }
 }
   
