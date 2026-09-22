@@ -118,7 +118,6 @@ async function checkOwner(req: Request): Promise<string | null> {
 
 function missingConfig(): string | null {
   const miss = [
-    !ACCOUNT_ID && 'R2_ACCOUNT_ID',
     !ACCESS_KEY && 'R2_ACCESS_KEY_ID',
     !SECRET_KEY && 'R2_SECRET_ACCESS_KEY',
     !BUCKET && 'R2_BUCKET',
