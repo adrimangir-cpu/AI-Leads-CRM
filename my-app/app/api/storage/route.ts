@@ -1,18 +1,6 @@
 /* ──────────────────────────────────────────────────────────────────────────
    Облачное хранилище съёмок: my-app/app/api/storage/route.ts
-
-   Живёт на Vercel, поэтому работает всегда — домашний компьютер и node index.js
-   для него не нужны. Сами файлы через этот обработчик НЕ проходят: он только
-   подписывает временные ссылки, а браузер потом общается с Cloudflare R2
-   напрямую. Поэтому нет ни ограничения Vercel в 4,5 МБ, ни платы за трафик.
-
-   Переменные окружения (Vercel → Settings → Environment Variables):
-     R2_ACCOUNT_ID         — идентификатор аккаунта Cloudflare
-     R2_ACCESS_KEY_ID      — ключ доступа R2
-     R2_SECRET_ACCESS_KEY  — секрет R2
-     R2_BUCKET             — имя корзины, например adriana-shoots
-     STORAGE_OWNER_EMAIL   — твоя почта входа в дашборд (только ей открыт доступ)
-     FIREBASE_WEB_API_KEY  — веб-ключ Firebase (тот же, что в my-app/firebase.js)
+   Адаптировано для Yandex Cloud Object Storage
    ────────────────────────────────────────────────────────────────────────── */
 
 export const runtime = 'edge';
@@ -23,8 +11,8 @@ const BUCKET = process.env.R2_BUCKET || '';
 const OWNER_EMAIL = (process.env.STORAGE_OWNER_EMAIL || '').toLowerCase();
 const FIREBASE_KEY = process.env.FIREBASE_WEB_API_KEY || '';
 
-const HOST = `${ACCOUNT_ID}.r2.cloudflarestorage.com`;
-const REGION = 'auto';
+const HOST = 'storage.yandexcloud.net';
+const REGION = 'ru-central1';
 const SERVICE = 's3';
 
 const enc = new TextEncoder();
@@ -42,7 +30,6 @@ async function hmac(key: ArrayBuffer | Uint8Array, data: string): Promise<ArrayB
   return crypto.subtle.sign('HMAC', cryptoKey, enc.encode(data));
 }
 
-/* Кодирование по правилам AWS: строже обычного encodeURIComponent */
 function uriEncode(str: string, encodeSlash = true): string {
   let out = '';
   for (const ch of str) {
@@ -56,8 +43,6 @@ function uriEncode(str: string, encodeSlash = true): string {
   return out;
 }
 
-/* Подписанная ссылка (AWS Signature V4, presigned URL).
-   Файл не проходит через сервер: браузер идёт по ней прямо в Cloudflare. */
 async function presign(
   method: 'GET' | 'PUT' | 'DELETE',
   key: string,
@@ -95,7 +80,6 @@ async function presign(
   return `https://${HOST}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-/* Доступ только владелице: проверяем токен входа в дашборд через Firebase */
 async function checkOwner(req: Request): Promise<string | null> {
   const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
   if (!token) return 'Нужно войти в дашборд';
@@ -128,7 +112,6 @@ function missingConfig(): string | null {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 
-/* Разбор XML-ответа R2 без сторонних библиотек */
 function parseList(xml: string) {
   const folders: string[] = [];
   for (const m of xml.matchAll(/<CommonPrefixes><Prefix>([^<]*)<\/Prefix><\/CommonPrefixes>/g)) folders.push(decodeXml(m[1]));
@@ -164,7 +147,7 @@ export async function GET(req: Request) {
   });
   const r = await fetch(listUrl);
   const xml = await r.text();
-  if (!r.ok) return json({ error: `Cloudflare ответил ${r.status}. ${xml.slice(0, 200)}` }, 502);
+  if (!r.ok) return json({ error: `Yandex ответил ${r.status}. ${xml.slice(0, 200)}` }, 502);
 
   const { folders, files, truncated } = parseList(xml);
   return json({ prefix, folders, files, truncated });
@@ -184,7 +167,6 @@ export async function POST(req: Request) {
 
   if (action === 'upload-url') {
     if (!key) return json({ error: 'Не указано имя файла' }, 400);
-    // час на загрузку: тяжёлые съёмки заливаются долго
     return json({ url: await presign('PUT', key, { expires: 3600 }) });
   }
 
@@ -207,16 +189,17 @@ export async function POST(req: Request) {
   if (action === 'delete') {
     if (!key) return json({ error: 'Не указан файл' }, 400);
     const r = await fetch(await presign('DELETE', key, { expires: 120 }), { method: 'DELETE' });
-    if (!r.ok && r.status !== 204) return json({ error: `Cloudflare ответил ${r.status}` }, 502);
+    if (!r.ok && r.status !== 204) return json({ error: `Yandex ответил ${r.status}` }, 502);
     return json({ ok: true });
   }
 
   if (action === 'make-folder') {
     const folder = key.endsWith('/') ? key : key + '/';
     const r = await fetch(await presign('PUT', folder + '.keep', { expires: 120 }), { method: 'PUT', body: '' });
-    if (!r.ok) return json({ error: `Cloudflare ответил ${r.status}` }, 502);
+    if (!r.ok) return json({ error: `Yandex ответил ${r.status}` }, 502);
     return json({ ok: true });
   }
 
   return json({ error: 'Неизвестное действие' }, 400);
 }
+
