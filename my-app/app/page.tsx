@@ -514,10 +514,22 @@ function PublicSite({ onAdminClick }) {
     return () => io.disconnect();
   }, [loading]);
 
-  const openLb = (shoot, idx) => setLb({
-    list: shoot.photos.map((p, i) => ({ url: p.url, cap: `${shoot.title} — ${i + 1} / ${shoot.photos.length}` })),
-    idx,
-  });
+  // Собираем все фото из всех категорий в один плоский список для сквозного перелистывания
+  const allPortfolioPhotos = useMemo(() => {
+    const list = [];
+    shoots.forEach(shoot => {
+      shoot.photos.forEach((p, i) => {
+        list.push({ url: p.url, cap: `${shoot.title} — ${i + 1} / ${shoot.photos.length}`, shootId: shoot.id, origIdx: i });
+      });
+    });
+    return list;
+  }, [shoots]);
+
+  const openLb = (shoot, idx) => {
+    // Находим позицию кадра в общем списке, чтобы листать вообще всё портфолио
+    const globalIdx = allPortfolioPhotos.findIndex(p => p.shootId === shoot.id && p.origIdx === idx);
+    setLb({ list: allPortfolioPhotos, idx: globalIdx > -1 ? globalIdx : 0 });
+  };
 
   return (
     <>
@@ -863,7 +875,7 @@ export default function Home() {
   const [stSearch, setStSearch] = useState('');
   const [stUploads, setStUploads] = useState([]);     // [{name, percent, error, done}]
   const [stBusyKey, setStBusyKey] = useState('');
-
+  const [stLb, setStLb] = useState({ list: [], idx: null });
   const humanSize = (n) => {
     if (!n && n !== 0) return '';
     if (n < 1024) return n + ' Б';
@@ -2088,18 +2100,20 @@ export default function Home() {
                 </p>
               )}
 
-              <div className="st-list">
+              <div className="st-grid">
                 {stFolders
                   .filter(f => !stSearch || f.toLowerCase().includes(stSearch.toLowerCase()))
                   .map(folder => {
                     const name = folder.replace(stPrefix, '').replace(/\/$/, '');
                     return (
-                      <div key={folder} className="st-row st-folder" onClick={() => loadStorage(folder)}>
-                        <div className="st-name">
-                          <span className="st-kind">папка</span>
-                          <span className="st-title">{name}</span>
+                      <div key={folder} className="st-card" onClick={() => loadStorage(folder)}>
+                        <div className="st-card-thumb">
+                          <span style={{ fontSize: '54px' }}>📁</span>
                         </div>
-                        <div className="st-actions"><span className="st-open">открыть</span></div>
+                        <div className="st-card-info">
+                          <span className="st-card-title" title={name}>{name}</span>
+                          <span className="st-card-meta">Папка</span>
+                        </div>
                       </div>
                     );
                   })}
@@ -2109,35 +2123,45 @@ export default function Home() {
                   .map(file => {
                     const name = file.key.split('/').pop();
                     const date = file.modified ? new Date(file.modified).toLocaleDateString('ru-RU') : '';
+                    
+                    // Распределяем файлы по типам
                     const isImage = /\.(jpe?g|png|webp|gif|heic|avif)$/i.test(name);
+                    const isRaw = /\.(cr2|cr3|nef|arw|dng|orf|rw2|raw)$/i.test(name);
+                    const isTiff = /\.(tiff?)$/i.test(name);
+                    const isPsd = /\.(psd)$/i.test(name);
+                    
+                    // В лайтбокс (перелистывание) пускаем только те фото, которые браузер может отобразить
+                    const imageFiles = stFiles.filter(f => /\.(jpe?g|png|webp|gif|heic|avif)$/i.test(f.key));
+                    const lbList = imageFiles.map(f => ({ url: f.url, cap: f.key.split('/').pop() }));
 
                     return (
-                      <div key={file.key} className="st-row">
-                        <div className="st-name" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '14px', minWidth: 0 }}>
+                      <div key={file.key} className="st-card" onClick={() => {
+                        // Открываем просмотр только для браузерных картинок
+                        if (isImage && file.url) {
+                          const idx = lbList.findIndex(x => x.url === file.url);
+                          if (idx > -1) setStLb({ list: lbList, idx });
+                        }
+                      }}>
+                        <div className="st-card-thumb">
                           {isImage && file.url ? (
-                            <div
-                              style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 4, overflow: 'hidden', cursor: 'zoom-in', border: '1px solid var(--line-soft)' }}
-                              onClick={() => window.open(file.url, '_blank')}
-                              title="Открыть в полном размере"
-                            >
-                              <img src={file.url} alt={name} loading="lazy" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            <img src={file.url} alt={name} loading="lazy" />
+                          ) : (isRaw || isTiff || isPsd) ? (
+                            <div style={{ display: 'grid', placeItems: 'center', width: '100%', height: '100%', background: 'var(--paper-2)' }}>
+                              <span style={{ fontSize: '18px', fontWeight: '800', fontFamily: 'Archivo', color: 'var(--mute)' }}>
+                                {isRaw ? 'RAW' : isTiff ? 'TIFF' : 'PSD'}
+                              </span>
                             </div>
                           ) : (
-                            <div style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 4, background: 'var(--paper-2)', border: '1px solid var(--line-soft)', display: 'grid', placeItems: 'center' }}>
-                              <span style={{ fontSize: '10px', color: 'var(--mute)', fontFamily: 'Archivo', textTransform: 'uppercase' }}>File</span>
-                            </div>
+                            <span style={{ fontSize: '12px', color: 'var(--mute)', fontFamily: 'Archivo', textTransform: 'uppercase' }}>Файл</span>
                           )}
-
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
-                            <span className="st-title" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-                            <span className="st-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
+                          <div className="st-card-actions">
+                            <button className="st-card-btn" onClick={(e) => { e.stopPropagation(); handleStorageDownload(file); }} title="Скачать">↓</button>
+                            <button className="st-card-btn" onClick={(e) => { e.stopPropagation(); handleStorageDelete(file); }} title="Удалить" style={{ color: '#8A3B33' }}>✕</button>
                           </div>
                         </div>
-                        <div className="st-actions">
-                          <button className="st-btn" disabled={stBusyKey === file.key} onClick={() => handleStorageDownload(file)}>
-                            {stBusyKey === file.key ? 'готовлю…' : 'скачать'}
-                          </button>
-                          <button className="st-btn st-del" disabled={stBusyKey === file.key} onClick={() => handleStorageDelete(file)}>удалить</button>
+                        <div className="st-card-info">
+                          <span className="st-card-title" title={name}>{name}</span>
+                          <span className="st-card-meta">{humanSize(file.size)}{date ? ` · ${date}` : ''}</span>
                         </div>
                       </div>
                     );
@@ -2287,6 +2311,13 @@ export default function Home() {
         </div>
       )}
 
+    {/* Лайтбокс для просмотра внутри хранилища */}
+      <Lightbox
+        list={stLb.list}
+        idx={stLb.idx}
+        onClose={() => setStLb({ list: [], idx: null })}
+        onMove={(d) => setStLb((p) => ({ ...p, idx: (p.idx + d + p.list.length) % p.list.length }))}
+      />
     </div>
   );
 }
@@ -2668,6 +2699,25 @@ td{padding:22px 12px 22px 0;font-size:14px;vertical-align:middle}
 .st-btn:disabled{opacity:.5;cursor:default}
 .st-del:hover{background:#8A3B33;border-color:#8A3B33;color:#fff}
 .st-total{margin-top:16px;color:var(--mute)}
+
+
+.st-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; margin-top: 16px; border-top: 1px solid var(--line-soft); padding-top: 20px; }
+.st-card { background: var(--paper-2); border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; cursor: pointer; transition: border-color 0.2s, transform 0.2s; position: relative; }
+.st-card:hover { border-color: var(--ink); transform: translateY(-2px); }
+.st-card-thumb { height: 140px; background: var(--paper); display: grid; place-items: center; overflow: hidden; border-bottom: 1px solid var(--line-soft); position: relative; }
+.st-card-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.st-card-info { padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+.st-card-title { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.st-card-meta { font-size: 11px; color: var(--mute); }
+.st-card-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; opacity: 0; transition: opacity 0.2s; }
+.st-card:hover .st-card-actions { opacity: 1; }
+.st-card-btn { background: rgba(255, 255, 255, 0.9); border: 1px solid var(--line); border-radius: 4px; width: 28px; height: 28px; display: grid; place-items: center; cursor: pointer; color: var(--ink); font-size: 14px; padding: 0; line-height: 1; backdrop-filter: blur(4px); }
+.st-card-btn:hover { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+@media (max-width:760px) {
+  .st-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
+  .st-card-actions { opacity: 1; } /* На мобилках кнопки видны всегда */
+}
+
 @media (max-width:760px){
   .st-row{flex-direction:column;align-items:flex-start;gap:10px}
   .st-actions{width:100%}
