@@ -875,6 +875,19 @@ export default function Home() {
   const [stSearch, setStSearch] = useState('');
   const [stUploads, setStUploads] = useState([]);     // [{name, percent, error, done}]
   const [stBusyKey, setStBusyKey] = useState('');
+  const [stDragOver, setStDragOver] = useState(false); // Для анимации перетаскивания
+
+  // Глобальный перехват Ctrl+V для вкладки хранилища
+  useEffect(() => {
+    const handlePaste = (e) => {
+      if (activeTab === 'files' && e.clipboardData?.files.length) {
+        e.preventDefault();
+        handleStorageUpload(e.clipboardData.files);
+      }
+    };
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [activeTab, stPrefix]); // Пересоздаем при смене папки, чтобы файлы летели куда нужно
   const [stLb, setStLb] = useState({ list: [], idx: null });
   const humanSize = (n) => {
     if (!n && n !== 0) return '';
@@ -2040,8 +2053,28 @@ export default function Home() {
           )}
 
           {activeTab === 'files' && (
-            <div>
+            <div 
+              style={{ position: 'relative', height: '100%', minHeight: '60vh' }}
+              onDragOver={(e) => { e.preventDefault(); setStDragOver(true); }}
+            >
+              {stDragOver && (
+                <div 
+                  onDragLeave={() => setStDragOver(false)}
+                  onDrop={(e) => { e.preventDefault(); setStDragOver(false); handleStorageUpload(e.dataTransfer.files); }}
+                  style={{ 
+                    position: 'absolute', inset: -16, background: 'rgba(246, 245, 242, 0.95)', 
+                    zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', 
+                    border: '3px dashed var(--ink)', borderRadius: '12px' 
+                  }}
+                >
+                  <h2 className="display" style={{ fontSize: '32px', pointerEvents: 'none', color: 'var(--ink)' }}>
+                    + Отпустите файлы для загрузки
+                  </h2>
+                </div>
+              )}
+
               <div className="sec-head" style={{ marginBottom: '20px' }}>
+  
                 <div>
                   <h2 className="display sec-title">хранилище</h2>
                   <p className="mono-label" style={{ marginTop: '8px', color: 'var(--mute)' }}>
