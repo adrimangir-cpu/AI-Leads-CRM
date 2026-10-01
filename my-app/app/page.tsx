@@ -566,7 +566,7 @@ function PublicSite({ onAdminClick }) {
       <button
         className={`menu-btn ${scrolled && !menu ? 'on' : ''}`}
         onClick={() => setMenu(true)}
-        aria-label="Открыть меню"
+        aria-label="Open menu"
       >
         <span /><span /><span />
       </button>
@@ -575,7 +575,7 @@ function PublicSite({ onAdminClick }) {
       <aside className={`drawer ${menu ? 'on' : ''}`} aria-hidden={!menu}>
         <div className="drawer-top">
           <span className="label">Меню</span>
-          <button className="drawer-x" onClick={() => setMenu(false)} aria-label="Закрыть меню">✕</button>
+          <button className="drawer-x" onClick={() => setMenu(false)} aria-label="Clouse menu">✕</button>
         </div>
         <nav className="drawer-nav">
           {nav.map(([href, label], i) => (
