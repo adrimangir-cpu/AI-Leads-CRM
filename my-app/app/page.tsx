@@ -32,30 +32,32 @@ const TABS = [
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:5000';
 
 const CATEGORIES = [
-  { id: 'beauty', num: '01', label: 'Бьюти' },
-  { id: 'lookbook', num: '02', label: 'Лук бук' },
-  { id: 'fashion', num: '03', label: 'Фешн' },
-  { id: 'art', num: '04', label: 'Творчество' },
-  { id: 'still', num: '05', label: 'Предметка' },
+  { id: 'beauty', num: '01', label: 'Beauty' },
+  { id: 'conceptual', num: '02', label: 'Conceptual Beauty' },
+  { id: 'fashion', num: '03', label: 'Fashion' },
+  { id: 'lookbook', num: '04', label: 'Lookbook' },
+  { id: 'jewelry', num: '05', label: 'Jewelry' },
+  { id: 'art', num: '06', label: 'Art' },
+  { id: 'still', num: '07', label: 'Still Life' },
 ];
 
 /* контакты-заглушки: показываются, пока в дашборде не заполнены свои */
 const FALLBACK_CONTACTS = {
-  telegram: { handle: '@adriana_retouch', url: 'https://t.me/adriana_retouch', sub: 'отвечаю быстрее всего' },
-  whatsapp: { handle: '+48 000 000 000', url: 'https://wa.me/48000000000', sub: 'звонки и сообщения' },
-  instagram: { handle: '@adriana.retouch', url: 'https://instagram.com/adriana.retouch', sub: 'свежие работы' },
-  email: { handle: 'hello@adriana.studio', url: 'mailto:hello@adriana.studio', sub: 'для брифов и договоров' },
+  telegram: { handle: '@adriana_retouch', url: 'https://t.me/adriana_retouch', sub: 'fastest reply' },
+  whatsapp: { handle: '+48 000 000 000', url: 'https://wa.me/48000000000', sub: 'calls & texts' },
+  instagram: { handle: '@adriana.retouch', url: 'https://instagram.com/adriana.retouch', sub: 'recent works' },
+  email: { handle: 'hello@adriana.studio', url: 'mailto:hello@adriana.studio', sub: 'for briefs & contracts' },
 };
 
 /* Бегущая строка в самом верху публичного сайта */
 const TICKER = [
-  'Кожа остаётся кожей',
-  'Первый кадр — бесплатно',
+  'Skin remains skin',
+  'First frame for free',
   'Beauty · Fashion · Still life',
-  'Отвечаю в тот же день',
+  'Same day delivery',
   'Photoshop · Capture One',
-  'PSD со слоями по запросу',
-  'Warsaw / Online',
+  'PSD with layers on request',
+  'Warsaw / Worldwide',
 ];
 
 /* ───────── умная раскладка: съёмка любого объёма → ряды по 1–3 кадра ───────── */
@@ -329,7 +331,6 @@ function LeadForm() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.ok === false) throw new Error(data.error || `статус ${res.status}`);
 
-      // дубль заявки в дашборд (без самих фото — они уже в Telegram)
       try {
         await addDoc(collection(db, 'leads_portfolio'), {
           name: payload.name, contact: payload.contact, task: payload.task, message: payload.message,
@@ -339,7 +340,7 @@ function LeadForm() {
 
       setDone({ name: payload.name, contact: payload.contact, count: files.length });
     } catch (e3) {
-      setErr('Не получилось отправить: ' + e3.message + '. Напиши мне напрямую в Telegram — так точно дойдёт.');
+      setErr('Failed to send: ' + e3.message + '. Please contact me directly via Telegram.');
     } finally {
       setSending(false);
     }
@@ -348,12 +349,12 @@ function LeadForm() {
   if (done) {
     return (
       <div className="ok">
-        <strong>Заявка отправлена.</strong>
+        <strong>Request successfully sent.</strong>
         <br />
-        {done.name}, я получила {done.count > 0 ? `${done.count} ${done.count === 1 ? 'фото' : 'фото'}` : 'твоё сообщение'} и отвечу на {done.contact} в течение дня.
+        {done.name}, I received {done.count > 0 ? `${done.count} ${done.count === 1 ? 'photo' : 'photos'}` : 'your message'} and will get back to you at {done.contact} shortly.
         <br />
         <button type="button" className="btn ghost" style={{ marginTop: 18 }} onClick={() => { setDone(null); setFiles([]); }}>
-          Отправить ещё
+          Send another
         </button>
       </div>
     );
@@ -362,20 +363,22 @@ function LeadForm() {
   return (
     <form className="form" onSubmit={submit}>
       <div className="form-row">
-        <label className="field"><span>Имя</span><input name="name" required placeholder="Как к тебе обращаться" /></label>
-        <label className="field"><span>Телефон или telegram</span><input name="contact" required placeholder="+48… или @username" /></label>
+        <label className="field"><span>Name</span><input name="name" required placeholder="How should I call you" /></label>
+        <label className="field"><span>Phone or Telegram</span><input name="contact" required placeholder="+48… or @username" /></label>
       </div>
       <label className="field">
-        <span>Что нужно обработать</span>
-        <select name="task" defaultValue="Бьюти — портрет / макро">
-          <option>Бьюти — портрет / макро</option>
-          <option>Лук бук</option>
-          <option>Фешн-съёмка</option>
-          <option>Творческий проект</option>
-          <option>Предметка</option>
+        <span>Type of work</span>
+        <select name="task" defaultValue="Beauty — portrait / macro">
+          <option>Beauty — portrait / macro</option>
+          <option>Conceptual Beauty</option>
+          <option>Fashion editorial</option>
+          <option>Lookbook</option>
+          <option>Jewelry</option>
+          <option>Art / Creative</option>
+          <option>Still life</option>
         </select>
       </label>
-      <label className="field"><span>Сообщение</span><textarea name="message" placeholder="Пара слов о задаче и сроках" /></label>
+      <label className="field"><span>Message</span><textarea name="message" placeholder="A few words about the task and deadlines" /></label>
 
       <div
         className={`drop ${hot ? 'hot' : ''}`}
@@ -383,17 +386,17 @@ function LeadForm() {
         onDragLeave={() => setHot(false)}
         onDrop={(e) => { e.preventDefault(); setHot(false); add(e.dataTransfer.files); }}
       >
-        <span>Приложи фото на тест — перетащи сюда, вставь из буфера или</span>
+        <span>Attach a test photo — drop here, paste from clipboard or</span>
         <label className="pick">
-          Выбрать файлы
+          Choose files
           <input type="file" accept="image/*" multiple hidden onChange={(e) => { add(e.target.files); e.target.value = ''; }} />
         </label>
         {files.length > 0 && (
           <div className="thumbs">
             {files.map((f, i) => (
               <div className="thumb" key={i}>
-                <img src={f.dataUrl} alt={`Вложение ${i + 1}`} />
-                <button type="button" onClick={() => setFiles(files.filter((_, k) => k !== i))} aria-label="Убрать фото">✕</button>
+                <img src={f.dataUrl} alt={`Attachment ${i + 1}`} />
+                <button type="button" onClick={() => setFiles(files.filter((_, k) => k !== i))} aria-label="Remove photo">✕</button>
               </div>
             ))}
           </div>
@@ -401,22 +404,20 @@ function LeadForm() {
       </div>
 
       <button type="submit" className="btn" style={{ width: 'fit-content' }} disabled={sending}>
-        {sending ? 'Отправляю…' : 'Отправить'} <span>→</span>
+        {sending ? 'Sending…' : 'Send request'} <span>→</span>
       </button>
       {err && <p className="note" style={{ color: '#8A3B33' }}>{err}</p>}
-      <p className="note">Заявка приходит мне в Telegram вместе с фото — обычно отвечаю в тот же день.</p>
+      <p className="note">The request is delivered to my Telegram along with the photos — I usually reply on the same day.</p>
     </form>
   );
 }
 
-/* ═════════════════ ПУБЛИЧНОЕ ПОРТФОЛИО ═════════════════ */
 function PublicSite({ onAdminClick }) {
   const [shoots, setShoots] = useState([]);
   const [ba, setBa] = useState([]);
   const [settings, setSettings] = useState(null);
   const [cat, setCat] = useState(CATEGORIES[0].id);
   const [lb, setLb] = useState({ list: [], idx: null });
-  // пропорции кадров, измеренные прямо из файлов — нужны старым фото без сохранённых размеров
   const [measuredAr, setMeasuredAr] = useState({});
   const measure = (url, el) => {
     const w = el && el.naturalWidth, h = el && el.naturalHeight;
@@ -425,9 +426,9 @@ function PublicSite({ onAdminClick }) {
     setMeasuredAr((prev) => (Math.abs((prev[url] || 0) - real) < 0.005 ? prev : { ...prev, [url]: real }));
   };
   const [loading, setLoading] = useState(true);
-  const [scrolled, setScrolled] = useState(false); // ушли ниже первого экрана
-  const [menu, setMenu] = useState(false);         // открыто боковое меню
-  const [atForm, setAtForm] = useState(false);     // форма отправки на экране
+  const [scrolled, setScrolled] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const [atForm, setAtForm] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -441,14 +442,13 @@ function PublicSite({ onAdminClick }) {
         setBa(bSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
         if (cfg.exists()) setSettings(cfg.data());
       } catch (e) {
-        console.error('не загрузился контент сайта', e);
+        console.error('Failed to load site content', e);
       } finally {
         setLoading(false);
       }
     })();
   }, []);
 
-  /* верхняя панель уезжает, вместо неё — кнопка бокового меню */
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 170);
     onScroll();
@@ -456,7 +456,6 @@ function PublicSite({ onAdminClick }) {
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
-  /* при открытом меню страница под ним не скроллится */
   useEffect(() => {
     document.body.style.overflow = menu ? 'hidden' : '';
     const onKey = (e) => { if (e.key === 'Escape') setMenu(false); };
@@ -472,13 +471,12 @@ function PublicSite({ onAdminClick }) {
     return m;
   }, [shoots]);
 
-  /* если в выбранной категории пусто — показываем первую непустую */
   useEffect(() => {
     if (!loading && !shoots.some((s) => s.category === cat)) {
       const first = CATEGORIES.find((c) => shoots.some((s) => s.category === c.id));
       if (first) setCat(first.id);
     }
-  }, [loading, shoots]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loading, shoots]);
 
   const withCoverFirst = (s) => {
     const ph = [...(s.photos || [])];
@@ -489,20 +487,20 @@ function PublicSite({ onAdminClick }) {
   const visible = shoots.filter((s) => s.category === cat).map((s) => ({ ...s, photos: withCoverFirst(s) }));
   const contacts = { ...FALLBACK_CONTACTS, ...(settings?.contacts || {}) };
   const facts = settings?.facts || [
-    { label: 'Опыт', value: '06', note: 'лет в постобработке' },
-    { label: 'Съёмок', value: '240+', note: 'обработано с 2020' },
-    { label: 'Тест-ретушь', value: 'Free', note: 'одно фото бесплатно' },
+    { label: 'Experience', value: '06', note: 'years in post-production' },
+    { label: 'Projects', value: '240+', note: 'retouched since 2020' },
+    { label: 'Test Retouch', value: 'Free', note: 'first photo is free' },
   ];
   const heroPhoto = settings?.heroUrl || '';
   const aboutPhoto = settings?.aboutUrl || '';
   const year = new Date().getFullYear();
 
   const nav = [
-    ['#about', 'Обо мне'],
-    ['#work', 'Портфолио'],
-    ...(ba.length > 0 ? [['#ba', 'До / после']] : []),
-    ['#contact', 'Контакты'],
-    ['#form', 'Тест-ретушь'],
+    ['#about', 'About'],
+    ['#work', 'Portfolio'],
+    ...(ba.length > 0 ? [['#ba', 'Before / After']] : []),
+    ['#contact', 'Contact'],
+    ['#form', 'Test Retouch'],
   ];
 
   useEffect(() => {
@@ -514,7 +512,6 @@ function PublicSite({ onAdminClick }) {
     return () => io.disconnect();
   }, [loading]);
 
-  // Собираем все фото из всех категорий в один плоский список для сквозного перелистывания
   const allPortfolioPhotos = useMemo(() => {
     const list = [];
     shoots.forEach(shoot => {
@@ -526,7 +523,6 @@ function PublicSite({ onAdminClick }) {
   }, [shoots]);
 
   const openLb = (shoot, idx) => {
-    // Находим позицию кадра в общем списке, чтобы листать вообще всё портфолио
     const globalIdx = allPortfolioPhotos.findIndex(p => p.shootId === shoot.id && p.origIdx === idx);
     setLb({ list: allPortfolioPhotos, idx: globalIdx > -1 ? globalIdx : 0 });
   };
@@ -599,12 +595,12 @@ function PublicSite({ onAdminClick }) {
           <div className="hero-over">post-production</div>
           <h1 className="display hero-main">adriana</h1>
           <div className="hero-meta">
-            <span className="label">Ретушь для beauty, fashion и предметной съёмки</span>
-            <p>{settings?.tagline || 'Сохраняю текстуру кожи и характер кадра. Работаю с фотографами, брендами и журналами — от одного портрета до полной обработки съёмки.'}</p>
+            <span className="label">Retouching for beauty, fashion, and still life</span>
+            <p>{settings?.tagline || 'I preserve skin texture and the authentic feel of the shot. I work with photographers, brands, and magazines — from a single portrait to a full campaign.'}</p>
           </div>
           <div className="hero-cta">
-            <a href="#form" className="btn">Отправить фото на тест <span>→</span></a>
-            <a href="#work" className="btn ghost">Смотреть работы</a>
+            <a href="#form" className="btn">Send photo for test <span>→</span></a>
+            <a href="#work" className="btn ghost">View portfolio</a>
           </div>
         </div>
         <figure className="hero-img">
@@ -620,7 +616,7 @@ function PublicSite({ onAdminClick }) {
         <div className="sec-head">
           <div>
             <div className="sec-num">01 — about</div>
-            <h2 className="display sec-title">обо мне</h2>
+            <h2 className="display sec-title">about me</h2>
           </div>
           {settings?.aboutNote ? <p className="sec-note">{settings.aboutNote}</p> : null}
         </div>
@@ -2227,11 +2223,13 @@ export default function Home() {
             <input type="text" placeholder="Название (например: Украшения — золото)" value={shootTitle} onChange={e => setShootTitle(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
             
             <select value={shootCategory} onChange={e => setShootCategory(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }}>
-              <option value="beauty">Бьюти</option>
-              <option value="lookbook">Лук бук</option>
-              <option value="fashion">Фешн</option>
-              <option value="art">Творчество</option>
-              <option value="still">Предметка</option>
+              <option value="beauty">Beauty</option>
+              <option value="conceptual">Conceptual Beauty</option>
+              <option value="fashion">Fashion</option>
+              <option value="lookbook">Lookbook</option>
+              <option value="jewelry">Jewelry</option>
+              <option value="art">Art</option>
+    
             </select>
 
             <input type="text" placeholder="Год (необязательно, например: 2026)" value={shootYear} onChange={e => setShootYear(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
