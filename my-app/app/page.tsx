@@ -2154,12 +2154,13 @@ export default function Home() {
                     const date = file.modified ? new Date(file.modified).toLocaleDateString('ru-RU') : '';
                     
                    // Распределяем файлы по типам
-                    const isImage = /\.(jpe?g|png|webp|gif|heic|avif|tiff?)$/i.test(name);
+                    const isImage = /\.(jpe?g|png|webp|gif|heic|avif)$/i.test(name);
                     const isRaw = /\.(cr2|cr3|nef|arw|dng|orf|rw2|raw)$/i.test(name);
+                    const isTiff = /\.(tiff?)$/i.test(name);
                     const isPsd = /\.(psd)$/i.test(name);
                     
-                    // В лайтбокс пускаем картинки и TIFF (для Safari)
-                    const imageFiles = stFiles.filter(f => /\.(jpe?g|png|webp|gif|heic|avif|tiff?)$/i.test(f.key));
+                    // В лайтбокс (перелистывание) пускаем только те фото, которые браузер может отобразить
+                    const imageFiles = stFiles.filter(f => /\.(jpe?g|png|webp|gif|heic|avif)$/i.test(f.key));
                     const lbList = imageFiles.map(f => ({ url: f.url, cap: f.key.split('/').pop() }));
 
                     return (
