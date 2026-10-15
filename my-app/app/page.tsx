@@ -1852,7 +1852,7 @@ export default function Home() {
                              <label className="badge" style={{ display: 'inline-block', marginTop: '14px', cursor: 'pointer', border: '1px solid var(--ink)' }}>
                                {shootBusyId === s.id ? `Загружаю ${uploadStep}${upPct > 0 && upPct < 100 ? ` · ${upPct}%` : ''}` : '+ Добавить кадры'}
                                <input type="file" accept="image/*" multiple hidden disabled={shootBusyId === s.id}
-                                 onChange={(e) => { const f = e.target.files; e.target.value = ''; handleAddPhotosToShoot(s, f); }} />
+                                 onChange={(e) => { const f = Array.from(e.target.files || []); e.target.value = ''; handleAddPhotosToShoot(s, f); }} />
                              </label>
                            </div>
                          )}
