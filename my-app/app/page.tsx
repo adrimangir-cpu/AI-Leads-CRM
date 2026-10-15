@@ -1011,6 +1011,7 @@ export default function Home() {
   const [upPct, setUpPct] = useState(0);
   const [shootBusyId, setShootBusyId] = useState('');
   const [openShootId, setOpenShootId] = useState('');
+  const [shootCatFilter, setShootCatFilter] = useState('all');
   const [cloudName, setCloudName] = useState('');
   const [uploadPreset, setUploadPreset] = useState('');
   const storeCfg = storageConfig({ cloudName, uploadPreset });
@@ -1242,6 +1243,17 @@ export default function Home() {
   };
 
   // Команда съёмки: одно свободное поле, выводится строкой под названием
+  const handleChangeShootCategory = async (shoot, category) => {
+    if (!category || category === shoot.category) return;
+    setShootError('');
+    try {
+      await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { category });
+      setPublicShoots(prev => prev.map(x => (x.id === shoot.id ? { ...x, category } : x)));
+    } catch (e) {
+      setShootError('Не удалось сменить категорию: ' + (e.message || e.code || 'ошибка'));
+    }
+  };
+
   const handleSaveTeam = async (shoot) => {
     const team = (teamDraft[shoot.id] !== undefined ? teamDraft[shoot.id] : (shoot.team || '')).trim();
     await updateDoc(doc(db, 'portfolio_shoots', shoot.id), { team });
@@ -1796,16 +1808,50 @@ export default function Home() {
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
                     <h3 style={{ fontFamily: 'Archivo', fontSize: '18px', margin: 0 }}>Управление съёмками</h3>
-                    <button onClick={() => { setShootError(''); setShowAddShoot(true); }} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить съёмку</button>
+                    <button onClick={() => { setShootError(''); if (shootCatFilter !== 'all') setShootCategory(shootCatFilter); setShowAddShoot(true); }} className="badge solid" style={{ cursor: 'pointer', border: 'none', padding: '10px 20px' }}>+ Добавить съёмку</button>
                   </div>
                   {shootError && <p style={{ fontSize: '12px', color: '#8A3B33', margin: '0 0 14px' }}>{shootError}</p>}
+                  <div className="shoot-cats">
+                    {[{ id: 'all', label: 'Все' }, ...CATEGORIES].map(c => {
+                      const n = c.id === 'all' ? publicShoots.length : publicShoots.filter(x => x.category === c.id).length;
+                      return (
+                        <button key={c.id} onClick={() => setShootCatFilter(c.id)} className={shootCatFilter === c.id ? 'on' : ''}>
+                          {c.label} <span>{n}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {(() => {
+                    const known = CATEGORIES.map(c => c.id);
+                    const groups = [
+                      ...CATEGORIES.map(c => ({ ...c, items: publicShoots.filter(x => x.category === c.id) })),
+                      { id: 'other', label: 'Без категории', items: publicShoots.filter(x => !known.includes(x.category)) },
+                    ].filter(g => (shootCatFilter === 'all' ? g.items.length > 0 : g.id === shootCatFilter));
+                    if (groups.length === 0 || groups.every(g => g.items.length === 0)) {
+                      return <p style={{ fontSize: '13px', color: 'var(--mute)', margin: '8px 0' }}>В этой категории пока нет съёмок.</p>;
+                    }
+                    return groups.map(g => (
+                  <div key={g.id} style={{ marginBottom: '28px' }}>
+                  {shootCatFilter === 'all' && <span className="mono-label" style={{ display: 'block', margin: '0 0 10px' }}>{g.label} · {g.items.length}</span>}
                   <div style={{ display: 'grid', gap: '16px' }}>
-                    {publicShoots.map(s => (
+                    {g.items.map(s => (
                        <div key={s.id} style={{ padding: '16px', border: '1px solid var(--line-soft)', background: 'var(--paper-2)', minWidth: 0 }}>
                          <div className="shoot-row">
                            <div style={{ minWidth: 0 }}>
                              <strong style={{ fontFamily: 'Archivo' }}>{s.title}</strong>{' '}
-                             <span style={{color: 'var(--mute)', fontSize: '13px'}}>({s.category}, {s.photos?.length || 0} фото)</span>
+                             <span style={{color: 'var(--mute)', fontSize: '13px'}}>{s.photos?.length || 0} фото</span>
+                             <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                               <span style={{ fontSize: '12px', color: 'var(--mute)' }}>Категория</span>
+                               <select
+                                 value={s.category}
+                                 onChange={(e) => handleChangeShootCategory(s, e.target.value)}
+                                 aria-label="Категория съёмки"
+                                 style={{ padding: '6px 10px', border: '1px solid var(--line)', background: 'var(--paper)', fontFamily: 'inherit', fontSize: '12px', outline: 'none', maxWidth: '100%' }}
+                               >
+                                 {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+                                 {!CATEGORIES.some((c) => c.id === s.category) && <option value={s.category}>{s.category || 'без категории'}</option>}
+                               </select>
+                             </div>
                            </div>
                            <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
                              <button onClick={() => setOpenShootId(openShootId === s.id ? '' : s.id)} style={{ background: 'none', border: 'none', color: 'var(--ink)', cursor: 'pointer', fontSize: '12px', textDecoration: 'underline' }}>
@@ -1859,6 +1905,9 @@ export default function Home() {
                        </div>
                     ))}
                   </div>
+                  </div>
+                    ));
+                  })()}
                 </div>
               )}
 
@@ -2223,13 +2272,7 @@ export default function Home() {
             <input type="text" placeholder="Название (например: Украшения — золото)" value={shootTitle} onChange={e => setShootTitle(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
             
             <select value={shootCategory} onChange={e => setShootCategory(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }}>
-              <option value="beauty">Beauty</option>
-              <option value="conceptual">Conceptual Beauty</option>
-              <option value="fashion">Fashion</option>
-              <option value="lookbook">Lookbook</option>
-              <option value="jewelry">Jewelry</option>
-              <option value="art">Art</option>
-    
+              {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
             </select>
 
             <input type="text" placeholder="Год (необязательно, например: 2026)" value={shootYear} onChange={e => setShootYear(e.target.value)} style={{ padding: '12px', border: '1px solid var(--ink)', background: 'transparent', outline: 'none', fontFamily: 'inherit' }} />
@@ -2669,6 +2712,11 @@ nav.tabs::-webkit-scrollbar{display:none}
 .cms-search{display:grid;grid-template-columns:1fr 2fr;gap:24px}
 .cms-2col>*,.cms-search>*{min-width:0}
 .shoot-row{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.shoot-cats{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 24px;border-bottom:1px solid var(--line-soft);padding-bottom:16px}
+.shoot-cats button{background:transparent;border:1px solid var(--line);color:var(--ink);font:inherit;font-size:12px;padding:7px 12px;cursor:pointer;letter-spacing:.02em}
+.shoot-cats button span{color:var(--mute);margin-left:4px}
+.shoot-cats button.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.shoot-cats button.on span{color:var(--line)}
 .ph-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
 .ph{position:relative;border:1px solid var(--line-soft);background:var(--paper);min-width:0}
 .ph.is-cover{border-color:var(--ink)}
