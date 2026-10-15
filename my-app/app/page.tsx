@@ -36,7 +36,7 @@ const CATEGORIES = [
   { id: 'conceptual', num: '02', label: 'Conceptual Beauty' },
   { id: 'fashion', num: '03', label: 'Fashion' },
   { id: 'lookbook', num: '04', label: 'Lookbook' },
-  { id: 'jewelry', num: '05', label: 'Jewelry' },
+  { id: 'jewellery', num: '05', label: 'jewellery' },
   { id: 'art', num: '06', label: 'Art' },
   { id: 'still', num: '07', label: 'Still Life' },
 ];
@@ -373,7 +373,7 @@ function LeadForm() {
           <option>Conceptual Beauty</option>
           <option>Fashion editorial</option>
           <option>Lookbook</option>
-          <option>Jewelry</option>
+          <option>jewellery</option>
           <option>Art / Creative</option>
           <option>Still life</option>
         </select>
